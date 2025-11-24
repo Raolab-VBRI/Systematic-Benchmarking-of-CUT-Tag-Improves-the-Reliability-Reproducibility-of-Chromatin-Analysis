@@ -1,0 +1,376 @@
+---
+title: "2-CUTandTag-RemoveDup-Picard"
+output: html_document
+date: "2024-02-16"
+author: Josiah Murray
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Begin by creating environmental variables and directories.
+```{r Create Enviromental Variables}
+jobreport_dir <- file.path("job_reports")
+figure_dir <- file.path("figures")
+data_dir <- file.path("data")
+rds_file <- file.path(data_dir, "alignSummary.rds")
+
+if (!(dir.exists(figure_dir))){
+  dir.create(figure_dir)
+}
+
+if (!(dir.exists(data_dir))){
+  dir.create(data_dir)
+}
+
+#Next we will use the Sys.setenv() command to make these file paths and variable accessible from the linux command line.
+Sys.setenv(PROJ_NAME = proj_name) 
+Sys.setenv(SCRATCH_DIR = paste0("/", scratch_dir)) #Accessing the scratch directory requires a backslash before the filepath
+Sys.setenv(JOBREP_DIR = paste0("/", scratch_dir, "/", jobreport_dir))
+```
+
+
+## Sort bam files
+It is useful to remove PCR duplicates from CUT&Tag data because even thought it's possible that some duplicate fragments are real... its difficult to say for sure. We can use picard to mark duplicate reads in the aligned bam files.
+```{cat Create Picard Script, engine.opts = list(file = 'scripts/4-sort_bam.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=sort_bam # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-16:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=25 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=esteen@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load required modules
+module load samtools
+module load picard
+module load parallel
+
+#Set directory paths
+projPath="/scratch/g/srrao/EGSx_CUTnTag"
+bamPath="${projPath}/alignment/bam"
+
+
+##Use picard to mark duplicate reads in the aligned BAM files.
+picardCMD="java -jar $PICARD"
+
+
+# Function to sort BAM files using Picard
+sort_bam() {
+    local i=$1
+    $picardCMD SortSam I="$i".bowtie2.bam O="$i".bowtie2.sorted.bam SORT_ORDER=coordinate
+    samtools index "$i".bowtie2.sorted.bam
+}
+
+
+
+# Export functions and variables for parallel
+export -f sort_bam 
+export picardCMD PICARD
+
+# Change to BAM directory for processing
+cd ${bamPath}
+
+# Run sorting in parallel (using 5 jobs at once with 5 cores each = 25 total cores)
+ls *.hg38.bowtie2.bam | cut -d . -f -2 | sort | uniq | parallel -j 5 sort_bam {}
+
+
+```
+
+Submit the Sort Bam job to SLURM
+```{bash Run sort_bam, engine.opts='-l'}
+sbatch scripts/4-sort_bam.sh
+```
+
+
+## Remove PCR Duplicates
+```{cat Create script to remove dups from BAM files, engine.opts = list(file = 'scripts/5-picard.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=picard # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=24 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH --output=%x.out # File to which standard output will be written
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=esteen@mcw.edu # Email adress to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+projPath="/scratch/g/srrao/EGSx_CUTnTag"
+bamPath="${projPath}/alignment/bam"
+outPath="${bamPath}/picard_summary"
+spikePath="${bamPath}/spike_bam"
+hg38Path="${bamPath}/hg38_bam"
+
+mkdir -p ${outPath}
+
+module load samtools
+module load picard
+module load parallel
+
+# Store the call for 
+picardCMD="java -jar $PICARD"
+
+# Define the processing function
+process_bam() {
+    local input_bam=$1
+    local output_path=$2
+    
+    # Get base name without extension
+    local base=$(basename "$input_bam" .bowtie2.bam)
+    
+    samtools index "$input_bam"
+    
+    $picardCMD MarkDuplicates \
+        I="$input_bam" \
+        O="${base}.bowtie2.rmDup.bam" \
+        TAG_DUPLICATE_SET_MEMBERS=true \
+        REMOVE_DUPLICATES=true \
+        METRICS_FILE="${output_path}/${base}.picard.rmDup.txt"
+    
+    samtools index "${base}.bowtie2.rmDup.bam"
+}
+
+export -f process_bam
+export picardCMD
+export outPath
+
+# Process hg38 BAMs. Picard can use up to 6 threads.
+cd $hg38Path
+echo "Processing hg38 BAMs in ${hg38Path}"
+ls *.bowtie2.bam | parallel -j 4 process_bam {} $outPath
+
+# Process spike-in BAMs
+cd $spikePath
+echo "Processing spike-in BAMs in ${spikePath}"
+ls *.bowtie2.bam | parallel -j 4 process_bam {} $outPath
+
+echo "Job completed at $(date)"
+
+```
+
+
+```{bash Run Bam Split, engine.opts='-l'}
+sbatch scripts/5-picard.sh
+```
+
+
+```{cat Create script for S3 normalization of BAM files, engine.opts = list(file = 'scripts/6-s3Norm.sh')}
+
+```
+
+
+
+
+## Create Sample Lists and Reading Data into R
+
+Before we create sample lists let's load the necessary R packages.
+```{r Load R Packages, echo=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(corrplot)
+library(GenomicRanges)
+library(Rsamtools)
+```
+
+
+Read the sample list text files into R
+```{r Read Sample Lists into R}
+bulk_sampleList <- scan(file = "BulkSampleList.txt", what = "character")
+```
+
+
+Now we have an object in R that is a list of all the sample names for either bulk or single cell CUT&Tag. Next lets enter in the different histone marks that we used in this assay.
+
+
+```{r Read Alignment Summary RDS}
+alignSummary <- readRDS(file = "alignSummary.rds")
+```
+
+##Summarize Duplicate Information from Picard
+
+We now have the sequencing depth and alignment rates for each of our samples... but how many of the paired end reads are duplicates? We can find this out by looking at the Picard reports.
+```{r Summarize Picard Duplicates for Bulk Samples}
+bulk_dupResult = c()
+for(hist in bulk_sampleList){
+  
+    if(file.exists(paste0("alignment/bam/picard_summary/", hist, ".mm.picard.rmDup.txt"))){
+    
+    spikeRes <- read.table(paste0("alignment/bam/picard_summary/", hist, ".mm.picard.rmDup.txt"), header = TRUE, fill = TRUE)
+    spike = "murine"
+  }
+  
+  dupRes = read.table(paste0("alignment/bam/picard_summary/", hist, ".hg38.picard.rmDup.txt"), header = TRUE, fill = TRUE)
+  
+  histInfo = strsplit(hist, "_")[[1]]
+  
+  bulk_dupResult = data.frame(Genotype = paste0(histInfo[1]), 
+                              Replicate = histInfo[3],
+                              Target = histInfo[2],
+                              Hg38_MappedFragNum = dupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric, 
+                              SpikeIn_MappedFragNum = spikeRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric,
+                              Hg38_DuplicationRate = dupRes$PERCENT_DUPLICATION[1] %>% as.character %>% as.numeric * 100,
+                              SpikeIn_DuplicationRate = spikeRes$PERCENT_DUPLICATION[1] %>% as.character %>% as.numeric * 100,
+                              Hg38_EstimatedLibrarySize = dupRes$ESTIMATED_LIBRARY_SIZE[1] %>% as.character %>% as.numeric,
+                              SpikeIn_EstimatedLibrarySize = spikeRes$ESTIMATED_LIBRARY_SIZE[1] %>% as.character %>% as.numeric,
+                              SpikeIn = spike) %>%
+                              mutate(Hg38_UniqueMappedFragNum = Hg38_MappedFragNum * (1-Hg38_DuplicationRate/100),
+                                     SpikeIn_UniqueMappedFragNum = SpikeIn_MappedFragNum * (1-SpikeIn_DuplicationRate/100)) %>%
+                                      rbind(bulk_dupResult, .)
+}
+
+bulk_dupResult$Genotype = factor(bulk_dupResult$Genotype)
+
+bulk_alignDupSummary = left_join(alignSummary, bulk_dupResult, by = c("Genotype", "Replicate", "SpikeIn", "Target"))
+
+bulk_alignDupSummary
+```
+
+
+
+
+```{r}
+# Save the bulk_alignDupSummary dataframes as an rds object.
+saveRDS(bulk_alignDupSummary,
+        file = "alignSummary.rds")
+
+# Read the RDS file 
+bulk_alignDupSummary <- readRDS("alignSummary.rds")
+```
+
+
+```{r Graph bulk alignment & duplication}
+dupFig1a <- bulk_alignDupSummary %>%
+  ggplot(aes(x = Genotype, y = Hg38_DuplicationRate)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = crosslinking), position = position_jitter(0.15), size = 3) +
+  scale_colour_manual(values = c("black", "#ed2024", "#4e69b1", "#fed82f", "#987d53")) +
+  ylab("Duplication Rate (%)") +
+  xlab("") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("EGSx CUT&Tag - Hg38 Duplication Rate") +
+  facet_wrap(~ Target)
+
+
+dupFig1a
+```
+
+```{r Save Bulk Duplication Rate Figure}
+ggsave(filename = "EGSx_CnT_DupRate.pdf", 
+       plot = dupFig1a, 
+       width = 8, 
+       height = 6,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+
+```
+
+
+
+```{r Graph bulk alignment & duplication}
+dupFig2a <- bulk_alignDupSummary %>%
+  ggplot(aes(x = Genotype, y = SpikeIn_DuplicationRate.y)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  ylab("Duplication Rate (%)") +
+  xlab("") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("EGSx CUT&Tag - Murine Duplication Rate") +
+  facet_wrap(~ Target)
+
+dupFig2a
+```
+
+## Aligned Fragments
+
+```{r Plot Aligned Frags}
+alignfragFig1a <- bulk_alignDupSummary %>%
+  ggplot(aes(x = Genotype, y = Hg38_MappedFragNum)) +
+  geom_boxplot(outlier.shape = NA) +
+  geom_jitter(aes(color = crosslinking), position = position_jitter(0.15), size = 3) +
+  scale_colour_manual(values = c("black", "#ed2024", "#4e69b1", "#fed82f", "#987d53")) +
+  ylab("Aligned Fragments") +
+  xlab("") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("EGSx CUT&Tag - Hg38 Aligned Frags") +
+  facet_wrap(~ Target)
+
+
+alignfragFig1a
+```
+
+
+##Estimated Library Sizes
+
+```{r Plot Estimated Library Sizes}
+# Original library size plot
+  libsizeFig1a <- bulk_alignDupSummary %>%
+    ggplot(aes(x = crosslinking, y = Hg38_EstimatedLibrarySize)) +
+    geom_boxplot(outlier.shape = NA) +
+    geom_jitter(aes(color = crosslinking), position = position_jitter(0.15), size = 2.3) +
+    scale_colour_manual(values = c("black", "#ed2024", "#4e69b1", "#fed82f", "#987d53")) +
+    ylab("Estimated Library Size") +
+    xlab("") +
+    theme_classic() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+          plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+    guides(fill="none") +
+    ggtitle("Estimated Library Size") +
+    facet_wrap(~Target, scales = "free_y")
+  
+
+
+  libsizeFig1a
+```
+
+
+
+
+```{r Save Estimated Library Size Figure}
+ggsave(filename = "EGSx_CnT_EstLibSize.pdf", 
+       plot = libsizeFig1a, 
+       device = "pdf",
+       width = 8, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+
+##Print session info
+```{r session info}
+sessionInfo()
+```
+

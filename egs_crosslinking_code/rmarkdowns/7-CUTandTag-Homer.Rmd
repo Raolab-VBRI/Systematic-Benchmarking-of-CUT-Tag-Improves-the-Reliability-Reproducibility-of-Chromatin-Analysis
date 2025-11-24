@@ -1,0 +1,482 @@
+---
+title: "9-CUTandTag-HOMER"
+output: html_document
+date: "2024-07-10"
+---
+## Set Up
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+
+
+```{r Load Packages}
+library(tidyverse)
+library(monaLisa)
+library(GenomicRanges)
+library(TFBSTools)
+library(ComplexHeatmap)
+```
+
+```{r Set directories}
+jobreport_dir <- file.path("job_reports")
+annotation_dir <- file.path("peak_annotations")
+figure_dir <- file.path("figures")
+homer_dir <- file.path(annotation_dir, "homer_results")
+```
+
+
+## Analyze Differential HOMER results
+```{r}
+diffmotif_results_dir <- list.files(file.path(homer_dir, "wholeGenomeBg"), 
+                          pattern = 'knownResults.txt', 
+                          full.names = TRUE,
+                          recursive = TRUE)
+
+```
+
+
+```{r}
+# Function to process HOMER motif analysis results
+# Input: Directory paths containing HOMER differential motif analysis results
+# Output: List containing:
+#   1. results: Data frame with motif analysis results
+#   2. seqlogos: Named list of sequence logos matching motif names
+process_homer_results <- function(diffmotif_results_dir) {
+  # Load required packages
+  library(stringr)
+  library(dplyr)
+  library(TFBSTools)
+  library(monaLisa)
+  
+  # Initialize empty data frame for results and list for sequence logos
+  result_df <- data.frame()
+  all_seqlogos <- list()
+  
+  # Process each directory containing HOMER results
+  for(dir in diffmotif_results_dir) {
+    # Extract bed file name from directory path (4th element after splitting)
+    bedFile <- str_split(dir, "/")[[1]][4]
+    
+    # Read the HOMER results file (tab-delimited)
+    res <- read.delim(file = dir,
+                      sep = "\t",
+                      header = TRUE)
+    
+    
+    # Get paths to known motif files
+    known_files <- list.files(
+      gsub("knownResults.txt", "knownResults", dir),
+      pattern = ".motif",
+      full.names = TRUE
+    )
+    
+    # Process motif files into PFMatrix objects
+    known_motif <- TFBSTools::PFMatrixList()
+    
+    for(i in seq_along(known_files)) {
+      pfm <- monaLisa::homerToPFMatrixList(known_files[i])
+      known_motif[[i]] <- pfm[[1]]
+      known_motif[[i]]@name <- pfm@listData[[1]]@ID
+    }
+    
+    # Create named vector of motif IDs
+    known_list <- vapply(
+      known_motif@listData,
+      function(x) x@ID,
+      character(1)
+    )
+    names(known_list) <- known_list
+    
+    # Process results
+    res <- res %>%
+      #dplyr::filter(Motif.Name %in% known_list) %>%
+      mutate(motif_name = sapply(str_split(Motif.Name, "/"), `[`, 1),
+             bedFile = bedFile)
+    
+    # Generate sequence logos with full motif names
+    seqlogos <- lapply(known_motif, seqLogoGrob)
+    names(seqlogos) <- vapply(known_motif, function(x) x@ID, character(1))
+    
+    # Update results
+    result_df <- bind_rows(result_df, res)
+    all_seqlogos <- c(all_seqlogos, seqlogos[!names(seqlogos) %in% names(all_seqlogos)])
+  }
+  
+  # Return results
+  return(list(
+    results = result_df,
+    seqlogos = all_seqlogos
+  ))
+}
+```
+
+
+```{r Get diff results}
+# Obtain HOMER results
+diffmotif_results <- process_homer_results(diffmotif_results_dir)
+
+head(diffmotif_results$results)
+```
+
+
+```{r Filter diff results}
+# Filter HOMER results for signifficant changes
+filtered_diffmotif_results <- diffmotif_results$results %>% 
+  mutate(Percent_of_Target_Sequences_with_Motif = as.numeric(gsub("%", "", X..of.Target.Sequences.with.Motif)),
+         Percent_of_Background_Sequences_with_Motif = as.numeric(gsub("%", "", X..of.Background.Sequences.with.Motif))) %>%
+  select(bedFile, Motif.Name, motif_name, Percent_of_Target_Sequences_with_Motif,
+         Percent_of_Background_Sequences_with_Motif, q.value..Benjamini.) %>%
+  # To make results comparable on heatmap, average Percent of Background sequences with motif to get a standard background
+  group_by(Motif.Name) %>%
+  mutate(Avg_Background_Sequences_with_Motif = mean(Percent_of_Background_Sequences_with_Motif)) %>%
+  ungroup() %>%
+  # Represent % changes as log2 Fold Enrichments
+  mutate(Log2FoldChange = log2((Percent_of_Target_Sequences_with_Motif + 0.001) / Avg_Background_Sequences_with_Motif)) %>%
+  # Group by Motif.Name and keep those with any significant q-value
+  group_by(Motif.Name) %>%
+  dplyr::filter(any(q.value..Benjamini. == 0.0) & any(Log2FoldChange > 0.8)) %>%
+  dplyr::filter(any(Percent_of_Target_Sequences_with_Motif > 10) | any(Percent_of_Background_Sequences_with_Motif > 30)) %>%
+  ungroup() %>%
+  mutate(bedFile = gsub(pattern = "NTC-DownIn-", replacement = "", bedFile) %>%
+                   gsub(pattern = "_RAD21", replacement = ""))
+  
+```
+
+
+
+```{r Create Matrix}
+remove_ls <- filtered_diffmotif_results %>% 
+  group_by(motif_name, bedFile) %>%
+  summarise(mean = mean(Log2FoldChange), .groups = "drop")  %>%
+  pivot_wider(id_cols = motif_name,
+              names_from = bedFile,
+              values_from = mean) %>%
+  column_to_rownames(var = "motif_name") %>%
+  dplyr::filter(if_all(everything(), ~. <= 1.3)) %>%
+  rownames_to_column() %>%
+  dplyr::pull(rowname)
+
+log2fc_matrix <- filtered_diffmotif_results %>% 
+  dplyr::filter(!grepl("Fly", Motif.Name)) %>%
+  group_by(motif_name, bedFile) %>%
+  summarise(mean = mean(Log2FoldChange), .groups = "drop") %>% 
+  # change bedFile name
+  dplyr::mutate(bedFile = str_split_i(bedFile, "_", 2)) %>% 
+  pivot_wider(id_cols = motif_name,
+              names_from = bedFile,
+              values_from = mean) %>%
+  # Remove redundant motifs
+  # Remember to label Atf4 with CEBP and CHOP
+  dplyr::filter(grepl("CTCF|BORIS", motif_name)) %>%
+  column_to_rownames(var = "motif_name") %>%
+  as.matrix()
+
+
+motifpercent_matrix <- filtered_diffmotif_results %>%
+  group_by(motif_name, bedFile) %>%
+  summarise(mean = mean(Percent_of_Target_Sequences_with_Motif), .groups = "drop") %>%
+  # change bedFile name
+  dplyr::mutate(bedFile = str_split_i(bedFile, "_", 2)) %>% 
+  pivot_wider(id_cols = motif_name,
+              names_from = bedFile,
+              values_from = mean) %>%
+  dplyr::filter(motif_name %in% rownames(log2fc_matrix)) %>% 
+  column_to_rownames(var = "motif_name") %>%
+  as.matrix()
+```
+
+
+### View HOMER Results
+
+```{r Create Heatmap Annotation}
+# Get one representative Motif.Name per motif_name, maintaining matrix row order
+representative_motifs <- filtered_diffmotif_results %>%
+  distinct(motif_name, .keep_all = TRUE) %>%
+  filter(motif_name %in% rownames(log2fc_matrix)) %>%  # ensure motifs are in matrix
+  arrange(match(motif_name, rownames(log2fc_matrix))) %>%  # match matrix order
+  pull(Motif.Name)
+
+# Create the annotation with properly ordered seqlogos
+seqlogo_anno <- rowAnnotation(
+  logo = annoSeqlogo(diffmotif_results$seqlogos[representative_motifs], which = "row"),
+  annotation_width = unit(1.5, "inch"),
+  show_annotation_name = FALSE)
+```
+
+
+```{r Create Heatmap}
+# Create column annotation with specified colors
+col_colors <- setNames(c( "#B3B3B3", "black", "#ed2024", "#4e69b1"),
+                       c("High-Confidence", "0nmEGS", "200nMEGS", "01pF"))
+
+
+col_anno <- HeatmapAnnotation(
+  df = data.frame(annotation = colnames(log2fc_matrix)),
+  col = list(annotation = col_colors),
+  annotation_name_side = "right",
+  show_legend = FALSE,
+  show_annotation_name = FALSE,
+  height = unit(2, "mm")
+)
+
+# Get the range of values for color scaling
+max_abs_value <- max(abs(log2fc_matrix), na.rm = TRUE)
+col_fun = circlize::colorRamp2(
+  c(0, 5),
+  c("white", "red")
+)
+
+
+
+
+hm <- Heatmap(matrix = log2fc_matrix,
+        show_column_names = TRUE,
+        column_names_rot = 45,
+        show_row_names = TRUE,
+        show_row_dend = FALSE,
+        cluster_columns = TRUE,
+        cluster_rows = TRUE,
+        name = "Log2\nEnrichment",
+        column_title = "Differential Motif Analysis",
+        show_heatmap_legend = FALSE,  # Hide the default heatmap legend
+        col = c("transparent", "transparent"),  # Make heatmap background transparent
+        right_annotation = seqlogo_anno,
+        row_names_gp = gpar(fontsize = 10),
+        top_annotation = col_anno,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          # Get the actual matrix values using the heatmap's data
+          color_val <- log2fc_matrix[i, j]
+          
+          # Check if the value exists in both matrices
+          if (!is.na(color_val) && !is.na(motifpercent_matrix[i, j])) {
+            color <- col_fun(color_val)
+            size_val <- motifpercent_matrix[i, j]
+            
+            # Normalize size to a specific range
+            min_size <- 2
+            max_size <- 4
+            # Normalize size_val to 0-1 range, then scale to min_size-max_size
+            normalized_size <- (size_val - min(motifpercent_matrix, na.rm = TRUE)) / 
+                               (max(motifpercent_matrix, na.rm = TRUE) - min(motifpercent_matrix, na.rm = TRUE))
+            point_size <- unit(min_size + normalized_size * (max_size - min_size), "char")
+            
+            
+            # Draw the point
+            grid.points(x, y, 
+                       pch = 21, 
+                       size = point_size,
+                       gp = gpar(col = "black", fill = color, lwd = 0.5))
+          }
+        })
+
+
+# Create a custom color legend
+color_legend <- Legend(
+  at = c(0, 2, 4),
+  labels = c("0", "2", "4"),
+  title = "Log2 Enrichment",
+  col_fun = col_fun,
+  direction = "horizontal"
+)
+
+# Combine heatmap and custom legend
+draw(hm)
+draw(color_legend, x = unit(0.8, "npc"), y = unit(0.9, "npc"))
+
+```
+
+
+
+```{r Save Figure}
+pdf(file = file.path(figure_dir, "EGS_CnT_HOMER_MotifEnrich.pdf"),
+    width = 5,
+    height = 3)
+draw(hm)
+draw(color_legend, x = unit(0.8, "npc"), y = unit(0.9, "npc"))
+dev.off()
+
+```
+
+
+
+## Analyze All HOMER results
+
+```{r}
+motif_results_dir <- list.files(file.path(homer_dir, "wholeGenomeBg"), 
+                          pattern = 'knownResults.txt', 
+                          full.names = TRUE,
+                          recursive = TRUE)
+```
+
+
+```{r Get all results}
+# Obtain HOMER results
+motif_results <- process_homer_results(motif_results_dir)
+```
+
+```{r Filter all results}
+# Filter HOMER results for signifficant changes
+filtered_motif_results <- motif_results$results %>% 
+  mutate(Percent_of_Target_Sequences_with_Motif = as.numeric(gsub("%", "", X..of.Target.Sequences.with.Motif)),
+         Percent_of_Background_Sequences_with_Motif = as.numeric(gsub("%", "", X..of.Background.Sequences.with.Motif))) %>%
+  select(bedFile, Motif.Name, motif_name, Percent_of_Target_Sequences_with_Motif,
+         Percent_of_Background_Sequences_with_Motif, q.value..Benjamini.) %>%
+  # Represent % changes as log2 Fold Enrichments
+  mutate(Log2FoldChange = log2(Percent_of_Target_Sequences_with_Motif / Percent_of_Background_Sequences_with_Motif)) %>%
+  # Group by Motif.Name and keep those with any significant q-value
+  group_by(Motif.Name) %>%
+  filter(any(q.value..Benjamini. < 1e-5)) %>%
+  filter(any(Percent_of_Target_Sequences_with_Motif > 45)) %>%
+  ungroup() %>%
+  mutate(bedFile = gsub(pattern = "NTC-DownIn-", replacement = "", bedFile) %>%
+                   gsub(pattern = "_RAD21", replacement = ""))
+
+```
+
+
+```{r Create Matrix}
+log2fc_matrix_all <- filtered_motif_results %>%
+  group_by(motif_name, bedFile) %>%
+  summarise(mean = mean(Log2FoldChange), .groups = "drop") %>% 
+  # change bedFile name
+  dplyr::mutate(bedFile = str_split_i(bedFile, "_", 2)) %>% 
+  pivot_wider(id_cols = motif_name,
+              names_from = bedFile,
+              values_from = mean) %>%
+  # Remove redundant motifs
+  # filter(!grepl("Elf4|ELF5|ELF3|ETS\\(|Atf|Fos|Fra|Etv|JunB|EWS|RUNX1|RUNX2|BORIS|VRN1|Elk4|IRF3|HLF|ETS1|SpiB|Jun−AP1|ETV1|IRF1|NFIL3|Chop|Jun−AP1|Elk1", motif_name)) %>%
+  column_to_rownames(var = "motif_name") %>%
+  as.matrix()
+
+motifpercent_matrix_all <- filtered_motif_results %>%
+  group_by(motif_name, bedFile) %>%
+  summarise(mean = mean(Percent_of_Target_Sequences_with_Motif), .groups = "drop") %>%
+  # change bedFile name
+  dplyr::mutate(bedFile = str_split_i(bedFile, "_", 2)) %>% 
+  pivot_wider(id_cols = motif_name,
+              names_from = bedFile,
+              values_from = mean) %>%
+  dplyr::filter(motif_name %in% rownames(log2fc_matrix_all)) %>% 
+  column_to_rownames(var = "motif_name") %>%
+  as.matrix()
+```
+
+
+```{r Create Heatmap Annotation}
+# Get one representative Motif.Name per motif_name, maintaining matrix row order
+representative_all_motifs <- filtered_motif_results %>%
+  distinct(motif_name, .keep_all = TRUE) %>%
+  filter(motif_name %in% rownames(log2fc_matrix_all)) %>%  # ensure motifs are in matrix
+  arrange(match(motif_name, rownames(log2fc_matrix_all))) %>%  # match matrix order
+  pull(Motif.Name)
+
+# Create the annotation with properly ordered seqlogos
+seqlogo_all_anno <- rowAnnotation(
+  logo = annoSeqlogo(motif_results$seqlogos[representative_all_motifs], which = "row"),
+  annotation_width = unit(1.5, "inch"),
+  show_annotation_name = FALSE)
+```
+
+
+```{r}
+# Create column annotation with specified colors
+col_colors <- setNames(c("#66C2A5", "#E78AC3", "#FFD92F", "#FC8D62", "#8DA0CB", "#E5C494", "#B3B3B3", "#A6D854"),
+                       c("Promoter", "CTCF-Promoter", "Active-CTCF-Enhancer", "Active-Enhancer", "Specified-Enhancer",
+                         "Poised-Enhancer", "None", "Solitary-CTCF"))
+
+
+col_anno <- HeatmapAnnotation(
+  df = data.frame(annotation = colnames(log2fc_matrix_all)),
+  col = list(annotation = col_colors),
+  annotation_name_side = "right",
+  show_legend = FALSE,
+  show_annotation_name = FALSE,
+  height = unit(2, "mm")
+)
+
+# Get the range of values for color scaling
+max_abs_value <- max(abs(log2fc_matrix_all), na.rm = TRUE)
+col_fun = circlize::colorRamp2(
+  c(-4, 0, 2),
+  c("blue", "white", "red")
+)
+
+
+
+
+hm <- Heatmap(matrix = log2fc_matrix_all,
+        show_column_names = TRUE,
+        column_names_rot = 45,
+        show_row_names = TRUE,
+        show_row_dend = FALSE,
+        cluster_columns = TRUE,
+        cluster_rows = TRUE,
+        name = "Log2\nEnrichment",
+        column_title = "Differential Motif Analysis",
+        show_heatmap_legend = FALSE,  # Hide the default heatmap legend
+        col = c("transparent", "transparent"),  # Make heatmap background transparent
+        right_annotation = seqlogo_all_anno,
+        row_names_gp = gpar(fontsize = 10),
+        top_annotation = col_anno,
+        cell_fun = function(j, i, x, y, width, height, fill) {
+          # Get the actual matrix values using the heatmap's data
+          color_val <- log2fc_matrix_all[i, j]
+          
+          # Check if the value exists in both matrices
+          if (!is.na(color_val) && !is.na(motifpercent_matrix_all[i, j])) {
+            color <- col_fun(color_val)
+            size_val <- motifpercent_matrix_all[i, j]
+            
+            # Normalize size to a specific range
+            min_size <- 0.3
+            max_size <- 3
+            # Normalize size_val to 0-1 range, then scale to min_size-max_size
+            normalized_size <- (size_val - min(motifpercent_matrix_all, na.rm = TRUE)) / 
+                               (max(motifpercent_matrix_all, na.rm = TRUE) - min(motifpercent_matrix_all, na.rm = TRUE))
+            point_size <- unit(min_size + normalized_size * (max_size - min_size), "char")
+            
+            
+            # Draw the point
+            grid.points(x, y, 
+                       pch = 21, 
+                       size = point_size,
+                       gp = gpar(col = "black", fill = color, lwd = 0.5))
+          }
+        })
+
+
+# Create a custom color legend
+color_legend <- Legend(
+  at = c(-4, -2, 0, 1, 2),
+  labels = c("-4", "-2", "0", "1", "2"),
+  title = "Log2 Enrichment",
+  col_fun = col_fun,
+  direction = "horizontal"
+)
+
+# Combine heatmap and custom legend
+draw(hm)
+draw(color_legend, x = unit(0.8, "npc"), y = unit(0.9, "npc"))
+```
+
+
+```{r}
+pdf(file = file.path(figure_dir, "OCIAML3_CnT-Rx_HOMER_RAD21_MotifEnrich.pdf"),
+    width = 7,
+    height = 14)
+draw(hm)
+draw(color_legend, x = unit(0.8, "npc"), y = unit(0.9, "npc"))
+dev.off()
+
+```
+
+
+## Print session info
+
+```{r}
+sessionInfo()
+```
+

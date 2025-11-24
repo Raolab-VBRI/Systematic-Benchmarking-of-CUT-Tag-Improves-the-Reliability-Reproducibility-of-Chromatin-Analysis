@@ -1,0 +1,550 @@
+---
+title: "1-CUTandTag-Import-Data-and-Align"
+output: html_document
+date: "2024-02-06"
+author: Josiah Murray
+---
+
+
+## Settings
+```{r Chunk Settings, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set up directories
+```{r}
+scripts_dir <- "scripts"
+ref_dir <- "ref_genomes"
+
+if(!dir.exists(scripts_dir)){
+  dir.create(scripts_dir)
+}
+
+if(!dir.exists(ref_dir)){
+  dir.create(ref_dir)
+}
+```
+
+## create index
+Download FASTA files for creating a bowtie index
+```{bash Download FASTA reference files, results = 'hide'}
+cd ref_genomes/
+#Downloading fasta files for index. I will use the primary assembly of GRCh38. (2/6/24)
+wget https://ftp.ensembl.org/pub/release-111/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+#Get mm39 from ensembl. We are not using a hard masked version.
+#wget https://ftp.ensembl.org/pub/release-112/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+```
+
+Use the sum command to ensure the downloads were successful.
+Here is what we should get:
+22450 861294 Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+16996 787519 Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
+```{bash Checksums for FASTA references}
+cd ref_genomes/
+
+sum *fa.gz
+```
+
+
+We want to create reference genomes that contain a combination of mouse and human genomes. This will allow us to determine how many spike-in reads are present and to filter out reads that align to both genomes.
+```{bash unzip fasta}
+cd ref_genomes/
+
+gzip -d *.fa.gz
+```
+
+
+```{bash Modify the chromosome names of Mm fasta files}
+cd ref_genomes/
+
+cat Mus_musculus.GRCm39.dna.primary_assembly.fa | sed 's/>/>mm_/g' > Mus_musculus.GRCm39.dna.primary_assembly_mod.fa
+```
+
+
+```{bash}
+cd ref_genomes/
+
+#combine the modified Mm fasta with CRCh38
+cat *{GRCm39.dna.primary_assembly_mod,GRCh38.dna.primary}*.fa > bowtie_hg38_mm39_custom/Homo_sapiens.GRCh38.dna.primary_Mus_musculus.GRCm39.dna.primary.fa
+```
+
+
+Now we can use bowtie2 to create indexes. Be sure to request sufficient RAM since building indexes is memory intenstive.
+```{cat Build Bowtie Index, engine.opts = list(file = 'scripts/1-index_build.sh')}
+#!/bin/bash
+
+#SBATCH -p bigmem # partition name
+#SBATCH --job-name=build_indexes # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-7:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=15 # number of threads
+#SBATCH --mem-per-cpu=30gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=alimeye@mcw.edu # Email adress to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+projPath="/scratch/g/srrao/AlisonEGS"
+
+cd $projPath/ref_genomes
+
+module load bowtie/2.5.0
+
+for I in $(ls *fa.gz)
+do
+
+D=$(echo $I | cut -d . -f 1,2,3)
+B=$(echo $I | cut -d . -f 1,2,3)
+
+#$I is the input file and $B is the name for bowtie output
+bowtie2-build --threads 15 $I $B
+
+mkdir $D
+
+mv *.bt2* $D/
+
+done
+
+```
+
+```{bash Run bowtie2-build, engine.opts='-l'}
+sbatch scripts/1-index_build.sh
+```
+
+
+##Trim Adapters
+All samples were sequenced 150 PE and adapters may be present. We will remove adapter sequences using cutadapt. 
+```{cat Create Trim Galore Script, engine.opts = list(file = 'scripts/2-trim.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=trim # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-18:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=15 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH --output=%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=alimeyer@mcw.edu # Email address to send job status messages to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load cutadapt/4.0
+module load parallel
+
+# Set directories
+projPath="/scratch/g/srrao/AlisonEGS"
+fastqPath="${projPath}/fastq"
+outPath="${projPath}/fastq_trim"
+
+# Create output directory
+mkdir -p $outPath
+
+trim_sample() {
+  local i=$1
+  
+  # Trim adapter sequences with cutadapt
+  cutadapt -j 5 -m 20 -a CTGTCTCTTATACACATCT -A CTGTCTCTTATACACATCT \
+  -o "$outPath"/"$i"_cut.1.fq.gz -p "$outPath"/"$i"_cut.2.fq.gz \
+  "$i"_1.fq.gz "$i"_2.fq.gz
+
+}
+
+export -f trim_sample
+export fastqPath outPath
+
+cd $fastqPath
+
+ls *_1.fq.gz | cut -d _ -f 1,2,3 | sort | uniq | parallel -j 3 trim_sample {}
+
+```
+
+```{bash Run trim script, engine.opts='-l'}
+sbatch scripts/2-trim.sh
+```
+
+##Align
+
+Now we can create a script file for aligning the fastq reads. We will need to submit this script to the SLURM in another chunk.
+```{cat Create Bowtie Script, engine.opts = list(file = 'scripts/3-bowtie2_align.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bowtie2_align # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 2-08:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=35 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=alimeyer@mcw.edu # Email address to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load bowtie/2.5.0
+module load samtools
+module load parallel
+
+# Set directories
+projPath="/scratch/g/srrao/AlisonEGS"
+bamPath="${projPath}/alignment/bam"
+sumPath="${projPath}/alignment/bam/bowtie2_summary"
+
+# Create bam paths
+mkdir -p $bamPath
+mkdir -p $sumPath
+
+
+#Set paths to bowtie 2 indexes
+#Spike In Alignment
+ref="${projPath}/ref_genomes/Homo_sapiens.GRCh38.dna/Homo_sapiens.GRCh38.dna"
+
+
+# Create a function for the alignment process
+align_sample() {
+  # Store sample ID from first argument
+  local i=$1
+  # All replicates have murine spike in
+  local O="hg38"
+  
+  # Pipeline: bowtie2 alignment -> sam to bam conversion
+  # --very-sensitive takes longer to run, but search for alignments more thoroughly.
+  # --no-mixed stops bowtie from aligning the mate of an unaligned read pair 
+  # --no-discordant means read pairs must align to same Chr.
+  # --phred33 indicate the phred scores for illumina sequencing. 
+  # -I & -X indicate the distance between paired reads
+  # Using 7 cores for each bowtie2 (running 5 parallel alignment = 35 total cpu)
+  # Pipe the stderr file to the bowtie2_summary directory using "2>"
+  # Pipe the stdout file (sam format) to samtools for conversion to a bam file
+  bowtie2 \
+    --local --very-sensitive \
+    --no-mixed --no-discordant \
+    --phred33 -I 10 -X 700 \
+    -p 7 \
+    -x ${ref} -1 ${projPath}/fastq_trim/"$i"_cut.1.fq.gz -2 ${projPath}/fastq_trim/"$i"_cut.2.fq.gz \
+    2> ${sumPath}/"$i"."$O".bowtie2.txt \
+  | samtools view -@ 7 -bS -o ${bamPath}/"$i"."$O".bowtie2.bam
+
+}
+
+# Make function and variables available to parallel processes
+export -f align_sample
+export ref projPath sumPath bamPath
+
+# Go to trimmed fastq directory 
+cd ${projPath}/fastq_trim
+
+# Now parallel can successfully run the function with all needed variables
+ls *_cut.1.fq.gz | cut -d _ -f 1,2,3 | sort | uniq \
+  | parallel -j 5 align_sample {}
+
+
+```
+
+Now we can submit the bowtie2_align.sh script to the RCC SLURM
+```{bash Run Bowtie Alignment, engine.opts='-l'}
+sbatch scripts/3-bowtie2_align.sh
+```
+
+
+We need to extract the primary alignments for our spike-in genomes. To do this we will need a text file that lists all the mouse chromosome names.
+```{bash Get Spike-In Chromosome Names}
+cd ref_genomes/bowtie_hg38_mm39_custom/
+
+cat Homo_sapiens.GRCh38.dna.primary_Mus_musculus.GRCm39.dna.primary.fa | grep "mm_" | cut -d " " -f 1 | sed 's/>//' | tr '\n' ' ' >MmChrNames.txt
+
+cd ..
+cat Homo_sapiens.GRCh38.dna.primary_assembly.fa | grep ">" | cut -d " " -f 1 | sed 's/>//' | tr '\n' ' ' >Hg38ChrNames.txt
+```
+
+
+## Perform QC for Sequencing and Alignment
+
+We can make some graphs showing reads, alignment rates, and spike-in percentages, but first we need to create a text file with all the sample names. This will be used to gather information about alignment rates and duplication rates.
+```{bash Create Text Files of Sample Lists}
+
+find alignment/bam/bowtie2_summary -type f -name '*bowtie2.txt' | xargs -n 1 basename | cut -d . -f 1 | sort | uniq  > BulkSampleList.txt
+
+```
+
+
+Read the sample list text files into R
+```{r Read Sample Lists into R}
+bulk_sampleList <- scan(file = paste0("BulkSampleList.txt"), what = "character")
+```
+
+
+Now we have an object in R that is a list of all the sample names.
+```{r Load Libraries for Plotting}
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(tidyverse)
+```
+
+## Visualize the Bowtie2 Alignment Rates
+
+Now we can take a deeper look at the alignment rate using the <sample_name>bowtie2.txt files
+```{r Summarize Bowtie2 Alignment Results for Bulk CUT&Tag Samples}
+
+bulk_alignResult = c() #start by making sure bulk_alignResult is empty
+
+for(hist in bulk_sampleList){
+  
+  if(file.exists(paste0("alignment/bam/bowtie2_summary/", hist, ".hg38.bowtie2.txt"))){
+    
+    alignRes = read.table(paste0("alignment/bam/bowtie2_summary/", hist, ".hg38.bowtie2.txt"), 
+                          header = FALSE, fill = TRUE) #The read.table function will import the bowtie2.txt output file
+    
+    alignRate = substr(alignRes$V1[6], 1, nchar(as.character(alignRes$V1[6]))-1) #Alignment rate from the bowtie2.txt file 
+   
+  }
+  
+  histInfo = strsplit(hist, "_")[[1]] #Sample names need to broken down so that you have just the respective histone mark
+  bulk_alignResult = data.frame(Genotype = paste0(histInfo[1]), 
+                           Replicate = histInfo[3],
+                           Target = histInfo[2],
+                           SequencingDepth = alignRes$V1[1] %>% as.character %>% as.numeric, 
+                           MappedFragNum = alignRes$V1[4] %>% as.character %>% as.numeric + alignRes$V1[5] %>% as.character %>% as.numeric, 
+                           AlignmentRate = alignRate %>% as.numeric)  %>% rbind(bulk_alignResult, .)
+}
+
+bulk_alignResult$Genotype = factor(bulk_alignResult$Genotype)
+bulk_alignResult 
+
+```
+
+
+
+```{r Save Alignment Data Frame as an RDS}
+saveRDS(bulk_alignResult, file = "alignSummary.rds")
+```
+
+
+```{r Visualize Alignment Rate}
+alignFig1a <- bulk_alignResult %>%
+  ggplot(aes(x=Genotype, y=AlignmentRate)) +
+  geom_boxplot(outlier.shape = NA) +
+  ylab("Percentage of Reads Aligned") +
+  xlab("") +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 12, hjust = 0.5, margin = margin(0,0,10,0))) +
+  ggtitle("Alignment Rate") +
+  facet_wrap(~ Target) 
+
+alignFig1b <- bulk_alignResult %>%
+  ggplot(aes(x=Genotype, y=AlignmentRate)) +
+  geom_boxplot(outlier.shape = NA) +
+  ylab("Percentage of Reads Aligned") +
+  xlab("") +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 12, hjust = 0.5, margin = margin(0,0,10,0))) +
+  ggtitle("Alignment Rate") +
+  facet_wrap(~ Target)
+
+alignFig1a
+alignFig1b
+```
+
+
+```{r Save Alignment Rate Figures}
+ggsave(filename = "EGSX_CnT_Alignrate.pdf", 
+       plot = alignFig1a, 
+       width = 8, 
+       height = 6,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+
+```
+
+
+
+```{r Visualize Mapped Frag Num}
+alignFig2a <- bulk_alignResult %>%
+  ggplot(aes(x=Genotype, y=MappedFragNum)) +
+  geom_boxplot(outlier.shape = NA) +
+  ylab("Count") +
+  xlab("") +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 12, hjust = 0.5, margin = margin(0,0,10,0))) +
+  ggtitle("Mapped Fragments") +
+  facet_wrap(~ Target)
+
+
+alignFig2a
+
+
+```
+
+```{r Save Mapped Frag Num Figures}
+ggsave(filename = "EGSX-CnT_MappedFrag.pdf", 
+       plot = alignFig2a, 
+       width = 8, 
+       height = 6,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+
+
+
+```
+
+
+```{r Visualize Sequencing Depth}
+alignFig3a <- bulk_alignResult %>%
+  ggplot(aes(x=Genotype, y=SequencingDepth)) +
+  geom_boxplot(outlier.shape = NA) +
+  ylab("Count") +
+  xlab("") +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 12, hjust = 0.5, margin = margin(0,0,10,0))) +
+  ggtitle("Mapped Fragments") +
+  facet_wrap(~ Target)
+
+
+alignFig3a
+
+```
+
+
+##Visualize Fragment Size Distribution
+
+```{cat Create Fragment Size Script, engine.opts = list(file = 'scripts/fragSize.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=fragSize # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-04:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=15 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=alimeyer@mcw.edu # Email address to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+projPath="/scratch/g/srrao/AlisonEGS"
+bamPath="${projPath}/alignment/bam"
+fragPath="${bamPath}/fragmentLen"
+
+mkdir -p $fragPath
+
+cd $bamPath
+
+module load samtools
+
+for i in $(ls *.bowtie2.bam)
+do
+
+o=$(echo $i | cut -d . -f 1)
+
+## Extract the 9th column from the alignment bam file which is the fragment length
+samtools view -@ 15 -F 0x04 $bamPath/$i | awk -F'\t' 'function abs(x){return ((x < 0.0) ? -x : x)} {print abs($9)}' | sort | uniq -c | awk -v OFS="\t" '{print $2, $1/2}' >$fragPath/"$o".fragmentLen.txt
+
+done
+```
+
+
+```{bash Run FragSize script, engine.opts='-l'}
+sbatch scripts/fragSize.sh
+```
+
+
+```{r Import Fragment Size Data into R}
+
+
+
+fragLen = c()
+for(hist in bulk_sampleList){
+  
+  histInfo = strsplit(hist, "_")[[1]]
+  
+  fragLen = read.table(paste0("alignment/bam/fragmentLen/", hist, ".fragmentLen.txt"), header = FALSE) %>%
+    mutate(fragLen = V1 %>% as.numeric, 
+           fragCount = V2 %>% as.numeric, 
+           Weight = as.numeric(V2)/sum(as.numeric(V2)),
+           Histone = paste0(histInfo[1], "_", histInfo[2]),
+           Genotype = histInfo[1],
+           Replicate = histInfo[3],
+           Target = histInfo[2]) %>% rbind(fragLen, .)
+           
+  }
+
+fragLen$Target = factor(fragLen$Target)
+fragLen$Genotype = factor(fragLen$Genotype)
+fragLen$Histone = factor(fragLen$Histone)
+```
+
+
+```{r}
+lenFig1a = fragLen %>% 
+    ggplot(aes(x = Histone, y = fragLen, weight = Weight, fill = Genotype)) +
+    geom_violin(bw = 5) +
+    scale_y_continuous(breaks = seq(0, 800, 50)) +
+    ggpubr::rotate_x_text(angle = 45) +
+    ylab("Fragment Length") +
+    xlab("") +
+  facet_wrap(~ Target)
+
+lenFig1b = fragLen %>% 
+    ggplot(aes(x = Histone, y = fragLen, weight = Weight, fill = Genotype)) +
+    geom_violin(bw = 5) +
+    scale_y_continuous(breaks = seq(0, 800, 50)) +
+    ggpubr::rotate_x_text(angle = 45) +
+    ylab("Fragment Length") +
+    xlab("") +
+  facet_wrap(~ Target)
+
+lenFig1a
+
+```
+
+```{r Save frag length figures}
+ggsave(filename = "EGSX_AlignFragLenDist.pdf", 
+       plot = lenFig1a, 
+       width = 8, 
+       height = 6,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+
+```
+
+
+
+
+```{r print session info}
+sessionInfo()
+```

@@ -1,0 +1,428 @@
+---
+title: "3-CUTandTag-Make_your_Bam_Bed"
+output: html_document
+date: "2023-07-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+ 
+Begin by loading required libraries and creating environmental variables.
+
+```{r Create Enviromental Variables}
+proj_name <- "EGSx_CUTnTag" #Enter a name for your project's directory
+
+#proj_id <- "" #This number is your basespace project ID. The number is shown in the URL when viewing your project on basespace.
+
+scratch_dir <- file.path("scratch", "g", "srrao", proj_name) #This builds a path for my RCC scratch directory
+
+jobreport_dir <- file.path("job_reports")
+
+figure_dir <- file.path("figures")
+
+bed_dir <- file.path("alignment", "bed")
+
+
+#Next we will use the Sys.setenv() command to make these file paths and variable accessible from the linux command line.
+Sys.setenv(PROJ_NAME = proj_name) 
+Sys.setenv(SCRATCH_DIR = paste0("/", scratch_dir)) #Accessing the scratch directory requires a backslash before the filepath
+Sys.setenv(JOBREP_DIR = paste0("/", scratch_dir, "/", jobreport_dir))
+```
+
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+```
+
+
+
+## Convert bam files to bed files
+
+Converting bam files to bed files will require a script that can be submitted to the SLURM. SEACR takes bedgraph files as an input so we will eventually get to that.
+```{cat Create bed Script, engine.opts = list(file = 'scripts/7-bedCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bedCreation # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=24 # number of threads
+#SBATCH --mem-per-cpu=7gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=esteen@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+projPath="/scratch/g/srrao/EGSx_CUTnTag"
+
+bamPath="${projPath}/alignment/bam"
+bedPath="${projPath}/alignment/bed"
+
+mkdir -p $bedPath
+
+
+module load samtools
+module load bedtools2
+module load parallel
+
+
+# Function to process BAM to BED conversion
+process_bam_to_bed() {
+    local i=$1
+    # Use samtools to sort reads by name, then convert to bed via bedtools
+    # Use awk to keep read pairs that are on the same chromosome and map within 1000bp of each other
+    samtools sort -n $bamPath/"$i".hg38.bowtie2.rmDup.bam \
+    | bedtools bamtobed -bedpe \
+    | awk '$1==$4 && $6-$2 < 1000 {print $0}' > $bedPath/"$i".bowtie2.clean.bed
+}
+
+
+# Function to process BED to fragments
+process_bed_to_fragments() {
+    local i=$1
+    # Extract the fragment related columns with cut
+    cut -f 1,2,6 $bedPath/"$i".bowtie2.clean.bed \
+    | sort -k1,1 -k2,2n -k3,3n > $bedPath/"$i".bowtie2.fragments.bed
+}
+
+# Export functions and variables for parallel
+export -f process_bam_to_bed process_bed_to_fragments
+export bamPath bedPath
+
+
+cd $bamPath
+
+# Process BAM files in parallel (using 6 jobs at once = 24 total cores with 4 cores each)
+ls *.hg38.bowtie2.rmDup.bam | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bam_to_bed {}
+
+cd $bedPath
+
+# Process BED files in parallel
+ls *.bowtie2.clean.bed | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bed_to_fragments {}
+
+
+```
+
+```{bash Creat Bed Files, engine.opts='-l'}
+sbatch scripts/7-bedCreation.sh
+```
+
+
+## Convert bed files to bedgraph (and scale based on mito reads)
+In order to create scaled bedgraph files we will need to have a file with the chromosome sizes for hg38. We can generate this using samtools faidx... Dont need to run this.
+```{bash, engine.opts='-l'}
+module load samtools
+
+samtools faidx ref_genomes/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+```
+
+
+Bed files can be normalized prior to converting to bedgraph for SEACR peak calling... but we can also try peak calling with non-normalized files.
+```{cat Create bed Script, engine.opts = list(file = 'scripts/8-bedgraphCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bedgraph # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-02:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=24 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=esteen@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# load modules
+module load bedtools2
+module load parallel
+
+# set up directories
+projPath="/scratch/g/srrao/EGSx_CUTnTag"
+bedPath="${projPath}/alignment/bed"
+bedgraphPath="${projPath}/alignment/bedgraph"
+
+chromSize="${projPath}/ref_genomes/Homo_sapiens.GRCh38.dna.primary_assembly.fa.fai"
+
+mkdir -p "${bedgraphPath}"
+
+
+
+# Function to process BED to BEDgraph conversion
+process_bed_to_bedgraph() {
+    local i=$1
+    bedtools genomecov -bg -i "$i".bowtie2.fragments.bed -g $chromSize \
+    >$bedgraphPath/"$i".bowtie2.fragments.bedgraph
+}
+
+# Export functions and variables for parallel
+export -f process_bed_to_bedgraph
+export bedPath bedgraphPath chromSize 
+
+# Go to bed directory
+cd ${bedPath}
+
+# Process BED files in parallel (using 6 jobs at once = 24 total cores with 4 cores each)
+ls *.bowtie2.fragments.bed | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bed_to_bedgraph {}
+
+
+echo "Done Creating Bedgraph files"
+```
+
+
+Now we can submit the bedCreation script to SLURM on RCC
+```{bash Submit bam to bed script to SLURM, engine.opts='-l'}
+sbatch scripts/8-bedgraphCreation.sh
+```
+
+
+## Create bigwigs
+
+
+```{cat Create bigwig Script, engine.opts = list(file = 'scripts/12-bigwigCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bigwig_convert # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-00:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=32 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send updates to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load deeptools
+module load samtools
+module load parallel
+
+
+# Set paths
+projPath="/scratch/g/srrao/josiah_ociaml3/EGSx_CUTnTag"
+bamPath="${projPath}/alignment/bam/hg38_bam"
+bigWigPath="${projPath}/alignment/bigwig"
+
+# Create output directories if they don't exist
+mkdir -p "$bigWigPath"
+
+# Function to process a single BAM file
+process_bam() {
+    local bamFile="$1"
+    local bigWigPath="$2"
+    
+    # Extract sample name from BAM filename
+    local sampleName=$(basename "$bamFile" .hg38.bowtie2.rmDup.bam)
+    
+    # Run bamCoverage with custom scaling factor
+    bamCoverage \
+        --bam "$bamFile" \
+        --outFileName "${bigWigPath}/${sampleName}.bw" \
+        --normalizeUsing "CPM" \
+        --binSize 5 \
+        --smoothLength 15 \
+        --numberOfProcessors 8 \
+        --extendReads
+    
+    # Check if conversion was successful
+    if [ $? -eq 0 ]; then
+        echo "Successfully created normalized BigWig file for $sampleName"
+        return 0
+    else
+        echo "Error: Failed to create BigWig file for $sampleName"
+        return 1
+    fi
+}
+
+# Export the function so it can be used by parallel
+export -f process_bam
+
+# Process BAM files in parallel
+echo "Starting parallel processing of BAM files..."
+find "${bamPath}" -name "*.hg38.bowtie2.rmDup.bam" | \
+    parallel --jobs 4 \
+    process_bam {} "${bigWigPath}"
+
+
+echo "Finished processing all files at $(date)"
+```
+
+Now we can submit the bedCreation script to SLURM on RCC
+```{bash Submit bam to bed script to SLURM, engine.opts='-l'}
+sbatch scripts/12-bigwigCreation.sh
+```
+
+
+## Assess replicate reproducibility 
+
+```{r Load Libraries}
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(purrr)
+library(pheatmap)
+```
+
+
+```{cat Create Script for 500 bp binned bed files, engine.opts = list(file = 'scripts/binnedBedCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=CUTTag_binnedBedCreation # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-05:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=12 # number of threads
+#SBATCH --mem-per-cpu=8Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=esteen@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+projPath="/scratch/g/srrao/EGSx_CUTnTag"
+
+bedPath="${projPath}/alignment/bed"
+
+cd ${bedPath}
+
+binLen=500
+for i in $(ls *.bowtie2.fragments.bed | cut -d '.' -f 1 | uniq)
+do
+awk -v w=$binLen '{print $1, int(($2 + $3)/(2*w))*w + w/2}' $projPath/alignment/bed/"$i".bowtie2.fragments.bed | sort -k1,1V -k2,2n | uniq -c | awk -v OFS="\t" '{print $2, $3, $1}' |  sort -k1,1V -k2,2n  >$projPath/alignment/bed/"$i".bowtie2.fragmentsCount.bin"$binLen".bed
+
+awk -v w=$binLen '{print $1, int(($2 + $3)/(2*w))*w + w/2}' $projPath/alignment/bed/"$i".bowtie2.fragments.bed | sort -k1,1V -k2,2n | uniq -c | awk -v OFS="\t" '{print $2, $3, $1}' |  sort -k1,1V -k2,2n  >$projPath/alignment/bed/"$i".bowtie2.fragmentsCount.bin"$binLen".bed
+done
+
+```
+```{bash Submit binnedBedCreation to SLURM, engine.opts='-l'}
+
+sbatch scripts/binnedBedCreation.sh
+```
+
+Read the sample list text files into R
+```{r Read Sample Lists into R}
+bulk_sampleList <- scan(file = paste0("BulkSampleList.txt"), what = "character")
+```
+
+Take the 500 bp binned bed files and calculate Pearson's correlation values
+```{r Calculating Pearsons Correlation Values for Bulk Samples with Duplicates}
+bulkFragCount = NULL
+for(hist in bulk_sampleList){
+  
+  if(is.null(bulkFragCount)){
+    
+    bulkFragCount = read.table(paste0("alignment/", "bed/", hist, ".bowtie2.fragmentsCount.bin500.bed"), header = FALSE) 
+    colnames(bulkFragCount) = c("chrom", "bin", hist)
+    
+  }else{
+    
+    fragCountTmp = read.table(paste0("alignment/", "bed/", hist, ".bowtie2.fragmentsCount.bin500.bed"), header = FALSE)
+    colnames(fragCountTmp) = c("chrom", "bin", hist)
+    bulkFragCount = dplyr::full_join(bulkFragCount, fragCountTmp, by = c("chrom", "bin"))
+    
+  }
+}
+```
+
+Make a correlation plot of the bulk samples
+```{r}
+M = cor(bulkFragCount %>% 
+          select(3:18) %>% 
+          log2(), use = "pairwise.complete.obs")
+```
+
+
+```{r Save Bulk Correlation Plot}
+# Save as PDF
+pdf("figures/correlation_with_dendrogram.pdf", width = 10, height = 12)
+
+# Create stacked plot (corrplot on top, dendrogram below)
+par(mfrow = c(2,1), mar = c(5,4,4,2))
+
+# Create correlation plot on top
+fig1a <- corrplot(M, method = "color",
+         order="hclust", 
+         type = 'full',
+         tl.col = "black",
+         tl.cex = 0.6,
+         tl.pos = 'l',
+         number.digits = 2, number.cex = 1,
+         is.corr = FALSE,
+         title = "EGSx CUT&Tag Pairwise Correlations",
+         col = colorRampPalette(rev(c(
+  "#440154", "#482878", "#3E4989", "#31688E", "#26828E",
+  "#1F9E89", "#35B779", "#6DCD59", "#B4DD2C", "#FDE725"
+)))(100),
+         col.lim = c(0.7,1),
+         mar = c(0,0,2,0))
+
+# Create dendrogram below (ignoring distance scale)
+plot(hc, main = "Hierarchical Clustering Dendrogram", 
+     xlab = "", ylab = "", sub = "", 
+     hang = -1)  # Makes all leaves align at the same level
+
+# Close PDF device
+dev.off()
+```
+
+
+```{r}
+# Create the same clustering that corrplot uses
+hc <- hclust(as.dist(1-M), method = "complete")
+
+# Create stacked plot (corrplot on top, dendrogram below)
+par(mfrow = c(2,1), mar = c(5,4,4,2))
+
+# Create correlation plot on top
+fig1a <- corrplot(M, method = "color",
+         order="hclust", 
+         type = 'full',
+         tl.col = "black",
+         tl.cex = 0.6,
+         tl.pos = 'l',
+         number.digits = 2, number.cex = 1,
+         is.corr = FALSE,
+         title = "EGSx CUT&Tag Pairwise Correlations",
+         col = colorRampPalette(rev(c(
+  "#440154", "#482878", "#3E4989", "#31688E", "#26828E",
+  "#1F9E89", "#35B779", "#6DCD59", "#B4DD2C", "#FDE725"
+)))(100),
+         col.lim = c(0.7,1),
+         mar = c(0,0,2,0))
+
+# Create dendrogram below
+plot(hc, main = "Hierarchical Clustering Dendrogram", 
+     xlab = "", ylab = "Distance", sub = "")
+
+# Reset plotting parameters
+par(mfrow = c(1,1), mar = c(5,4,4,2))
+
+fig1a
+```
+
+
+## Session Info
+```{r}
+sessionInfo()
+```
+

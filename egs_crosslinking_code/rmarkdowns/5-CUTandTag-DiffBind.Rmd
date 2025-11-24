@@ -1,0 +1,213 @@
+---
+title: "5-CUTandTag-DiffBind"
+output: html_document
+date: "2023-09-13"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.keep = 'last')
+```
+
+## Set up
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+```{r Load Libraries, echo=FALSE}
+library(DiffBind)
+library(tidyverse)
+library(rtracklayer)
+library(ggplot2)
+library(dplyr)
+library(BiocParallel)
+library(mgcv)
+library(VennDiagram)
+library(rstatix)
+
+# Verify the new settings
+bpparam()
+```
+
+
+```{r Make Directories}
+jobreport_dir <- file.path("job_reports")
+diffbind_dir <- file.path("diffbind")
+bam_dir <- file.path("alignment", "bam", "hg38_bam")
+macs_dir <- file.path("peakCalling", "MACS3")
+figure_dir <- file.path("figures")
+occupancy_dir <- file.path(diffbind_dir, "occupancy_results")
+res_dir <- file.path(diffbind_dir, "diffbind_results")
+
+
+if(!dir.exists(occupancy_dir)){
+  dir.create(occupancy_dir, recursive = TRUE)
+}
+if(!dir.exists(res_dir)){
+  dir.create(res_dir, recursive = TRUE)
+}
+```
+
+
+## Read in Peaksets from MACS3
+DiffBind needs a sampleSheet with some key information: 
+SampleID (must be unique for each sample), Condition, Replicate (should be a number), bamReads (file path), bamControl (file path), Peaks (file path), PeakCaller (string that indicates what peak caller was used))
+
+```{r Create a dataframe with MACS3 metadata}
+bulk_sampleList <- scan(file = "BulkSampleList.txt", what = "character")
+to_match <- c("IgG")
+igg_list <- grep(paste(to_match, collapse = "|"), bulk_sampleList)
+histlist <- c("CTCF")
+
+
+
+for(target in histlist){
+  samples <- c()
+  sampleList <- bulk_sampleList[-igg_list]
+  sampleList <- sampleList[grep(paste0(target, "_"), sampleList)]
+  
+    for(hist in sampleList){
+      histInfo = strsplit(hist, "_")[[1]]
+      
+       macs_ext <- ".macs3.nolambda_peaks.narrowPeak"
+       peak_type <- "narrow"
+        
+      rep <- as.factor(c("A", "B", "C", "D", "E", "F", "G", "H"))
+      
+      cond <- dplyr::case_when(
+      grepl("500nMEGS-01pF", histInfo[3]) ~ "500nMEGS-01pF",
+      grepl("200nMEGS-01pF", histInfo[3]) ~ "200nMEGS-01pF",
+      grepl("200nMEGS", histInfo[3]) ~ "200nMEGS",
+      grepl("500nMEGS", histInfo[3]) ~ "500nMEGS",
+      grepl("0nMEGS", histInfo[3]) ~ "0nMEGS",
+      grepl("01pF", histInfo[3]) ~ "01pF")
+      
+
+      # Build the sampleSheet for diffbind
+      samples <- data.frame(SampleID = hist,
+                 Treatment = histInfo[2],
+                 Condition = cond,
+                 Replicate = histInfo[3],
+                 Tissue = histInfo[1],
+                 bamReads = paste0(bam_dir, "/", 
+                                   hist, ".hg38.bowtie2.rmDup.bam"), #Duplicates removed
+                 ControlID = paste0(histInfo[1], "_IgG_", histInfo[3]),
+                 bamControl = paste0(bam_dir, "/", 
+                                     histInfo[1], "_IgG_", histInfo[3], ".hg38.bowtie2.rmDup.bam"), # Duplicates removed
+                 Peaks = paste0(macs_dir, "/", hist, macs_ext),
+                 PeakCaller = peak_type) %>%
+        rbind(samples, .)
+    }
+  
+  # Create csv for diffbind
+  write_csv(samples, file = paste0(diffbind_dir, "/", target, "_oci_diffbind.csv"))
+
+}
+```
+
+
+## Create DBAs
+
+DiffBind works by creating a dba object
+```{r Creat DBA object for Rad21 SEACR}
+ctcf_dba <- DiffBind::dba(sampleSheet = "diffbind/CTCF_oci_diffbind.csv")
+```
+
+Dba objects contain summary information that can be very useful. At this point we haven't actaully added counts to our dba object so we can only see the number of peaks.
+```{r examine dba objects}
+ctcf_dba
+```
+
+
+
+This first heatmap is based on the peak files from MACS3 which are used to create "occupancy scores." Essentially, peaks with more overlaps are considered to be more closely correlated.
+```{r dba heatmap}
+dba.plotHeatmap(ctcf_dba)
+```
+
+
+
+```{r dba pca}
+dba.plotPCA(ctcf_dba)
+```
+
+
+## Exploring Peak Overlaps
+DiffBind will look for differential binding by creating a list of consensus sites. It is a good idea to consider how many of the peaks in your samples overlap with one another.
+```{r Get Peak Overlaps for All Rad21 Samples}
+ctcf.olap.rate <- dba.overlap(ctcf_dba, mode = DBA_OLAP_RATE)
+
+
+plot(ctcf.olap.rate, type='b', ylab='# peaks', xlab='Overlap at least this many peaksets', main = "MACS2 - CTCF Peaks")
+```
+
+
+
+## Consensus Peak Occupancy Analysis
+
+```{r Create function for identifying consensus peaks}
+get_consensus <- function(
+                  dba_object,
+                  min_overlaps,
+                  out_dir,
+                  target
+                  ){
+  # Check if required packages are installed
+  if (!require(DiffBind)) {
+    stop("DiffBind package is required but not installed")
+  }
+  
+  
+  # Initiate consensus peak list
+  consensus_list <- list()
+  
+  # Make consensus peaklist with error handling
+  tryCatch({
+    consensus.peaks <- dba.peakset(dba_object, consensus = DBA_CONDITION, minOverlap = min_overlaps)
+    
+    # Get consensus peaks
+    consensus <- dba(consensus.peaks, consensus.peaks$masks$Consensus, minOverlap = 1)
+    
+    # Process each condition
+    for(cond in c("0nMEGS", "200nMEGS", "01pF")){
+      # Retrieve consensus peaks for each condition
+      consensus_list[[cond]] <- dba.peakset(consensus, consensus$masks[[cond]], bRetrieve = TRUE)
+      
+      # Export consensus peaks as a bed file
+      if (!is.null(consensus_list[[cond]])) {
+        rtracklayer::export.bed(consensus_list[[cond]],
+                              con = file.path(out_dir, paste0(cond, "_", target, "_consensus.macs3.bed")))
+        
+        # Report # of consensus peaks
+        print(paste0("Number of consensus peaks for ", cond, " ", target, " is: ", length(consensus_list[[cond]])))
+        
+      } else {
+        warning(paste("No consensus peaks found for condition:", cond))
+      }
+    }
+    
+    # Return the consensus list
+    return(consensus_list)
+    
+  }, error = function(e) {
+    warning(paste("Error in generating consensus peaks:", e$message))
+    return(NULL)
+  })
+}
+
+```
+
+
+
+Consensus peaks will be any peak identified in 50% or more replicates for a particular genotype 
+```{r Export consensus peaks for non-RAD21 dba's}
+ctcf_consensus <- get_consensus(dba_object = ctcf_dba,
+                                min_overlaps = 0.5,
+                                out_dir = occupancy_dir,
+                                target = "CTCF")
+```
+
+
+
+## Print Session Info
+```{r Print Session Info}
+sessionInfo()
+```
