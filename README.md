@@ -4,9 +4,6 @@
 
 This repository contains analysis code associated with the manuscript **"Systematic Benchmarking of CUT&Tag Improves the Reliability and Reproducibility of Chromatin Analysis"** by Murray & Ray et al.
 
-## Authors
-
-Murray & Ray et al.
 
 ## Repository Contents
 

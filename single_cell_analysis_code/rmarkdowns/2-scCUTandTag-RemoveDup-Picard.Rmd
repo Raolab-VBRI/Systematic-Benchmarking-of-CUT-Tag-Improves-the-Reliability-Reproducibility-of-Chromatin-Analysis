@@ -1,0 +1,1238 @@
+---
+title: "2-CUTandTag-RemoveDup-Picard"
+output: html_document
+date: "2024-02-16"
+author: Josiah Murray
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Begin by creating environmental variables and directories.
+```{r Create Enviromental Variables}
+jobreport_dir <- file.path("job_reports")
+picard_dir <- file.path("alignment", "bam", "picard_batch_metrics")
+picard_sc_dir <- file.path("alignment", "bam", "picard_metrics")
+figure_dir <- file.path("figures")
+data_dir <- file.path("data")
+rds_file <- file.path(data_dir, "ociaml3_bulk.rds")
+
+if (!(dir.exists(figure_dir))){
+  dir.create(figure_dir)
+}
+
+if (!(dir.exists(data_dir))){
+  dir.create(data_dir)
+}
+```
+
+
+
+## Remove PCR Duplicates
+```{cat Create script to remove dups from BAM files, engine.opts = list(file = 'scripts/4-picard.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=picard # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=30 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+#Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bamPath="${projPath}/alignment/bam"
+okurBamPath="${bamPath}/okur_bam"
+ociBamPath="${bamPath}/oci_bam"
+picardMetricsPath="${bamPath}/picard_metrics"
+
+# Create output directories
+mkdir -p "${picardMetricsPath}"
+
+# Load modules
+module load samtools
+module load picard
+module load parallel
+
+# Store the call for picard
+picardCMD="java -jar $PICARD"
+
+# Define the processing function
+process_bam() {
+    local input_bam=$1
+    local output_path=$2
+    
+    # Get base name without extension
+    local base=$(basename "$input_bam" .bowtie2.bam)
+    
+    # Filter out unaligned reads (-F 4) and sort in one pipeline
+    samtools view -h -F 4 "$input_bam" | samtools sort -@ 6 -o "${base}.bowtie2.sorted.bam"
+    
+    if [ $? -eq 0 ]; then
+        # Index the sorted BAM
+        samtools index "${base}.bowtie2.sorted.bam"
+        
+        # Mark duplicates using Picard
+        $picardCMD MarkDuplicates \
+            I="${base}.bowtie2.sorted.bam" \
+            O="${base}.bowtie2.rmDup.bam" \
+            TAG_DUPLICATE_SET_MEMBERS=true \
+            REMOVE_DUPLICATES=true \
+            METRICS_FILE="${picardMetricsPath}/${base}.picard.rmDup.txt"
+        
+    else
+        echo "Error: samtools filtering/sorting failed for $base"
+        return 1
+    fi
+}
+
+# Export function and variables for parallel
+export -f process_bam
+export picardCMD bamPath picardMetricsPath
+
+# Process OCI BAMs Picard can use up to 6 threads.
+cd $ociBamPath
+echo "Processing OCI BAMs in $ociBamPath"
+ls *.bowtie2.bam | parallel -j 5 process_bam {} $bamPath
+
+# Process Okur BAMs
+cd $okurBamPath
+echo "Processing Okur BAMs in $okurBamPath"
+ls *.bowtie2.bam | parallel -j 5 process_bam {} $bamPath
+
+echo "Job completed at $(date)"
+
+```
+
+
+```{bash Run Bam Split, engine.opts='-l'}
+sbatch scripts/4-picard.sh
+```
+
+## Visualize the Bowtie2 Alignment Rates
+
+
+```{r}
+picard_sc_files <- list.files(path = picard_sc_dir, pattern = ".hg38.picard.rmDup.txt") %>% 
+  str_split_i(., pattern = "\\.", i=1) %>% unique()
+
+picard_sc_files[1]
+```
+
+
+
+Now we can take a deeper look at the alignment rate using the <sample_name>bowtie2.txt files
+```{r Summarize Bowtie2 Alignment Results for Bulk CUT&Tag Samples}
+bulk_alignResult = c() #start by making sure bulk_alignResult is empty
+
+for(hist in picard_sc_files){
+  
+  # Check if file exists and has content
+  file_path <- file.path(picard_sc_dir, paste0(hist, ".hg38.picard.rmDup.txt"))
+  if (!file.exists(file_path)) {
+    cat("ERROR: File does not exist:", file_path, "\n")
+    next
+  }
+  
+  # Check file size
+  file_size <- file.info(file_path)$size
+  
+  if (file_size == 0) {
+    cat("ERROR: File is empty:", file_path, "\n")
+    next
+  }
+  
+  # Try to read the file with error handling
+  dupRes <- tryCatch({
+    read.table(file_path, header = TRUE, fill = TRUE)
+  }, error = function(e) {
+    cat("ERROR reading file:", file_path, "\n")
+    cat("Error message:", e$message, "\n")
+    return(NULL)
+  })
+  
+  # Skip if reading failed
+  if (is.null(dupRes)) {
+    cat("Skipping file:", hist, "\n")
+    next
+  }
+  
+  histInfo = strsplit(hist, "_")[[1]]
+  
+  bulk_alignResult = data.frame(Genotype = paste0(histInfo[1]),
+                              Replicate = histInfo[3] %>% as.numeric,
+                              AlignFragNum = dupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric, 
+                              UniqueFragNum = (dupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric) - 
+                                              (dupRes$READ_PAIR_DUPLICATES[1] %>% as.character %>% as.numeric),
+                              DuplicateFragNum = dupRes$READ_PAIR_DUPLICATES[1] %>% as.character %>% as.numeric,
+                              DuplicationRate = dupRes$PERCENT_DUPLICATION[1]  %>% as.character %>% as.numeric * 100,
+                              EstimatedLibrarySize = dupRes$ESTIMATED_LIBRARY_SIZE[1] %>% as.character %>% as.numeric
+                              ) %>%
+                              dplyr::mutate(SequencingSaturation = UniqueFragNum / EstimatedLibrarySize) %>%
+                                      rbind(bulk_alignResult, .)
+}
+
+bulk_alignResult$Genotype <- factor(bulk_alignResult$Genotype)
+```
+
+
+
+```{r Save Alignment Data Frame as an RDS}
+saveRDS(bulk_alignResult, file = "alignSummary.rds")
+```
+
+
+```{r Visualize Alignment Rate}
+scFragFig <- bulk_alignResult %>%
+  dplyr::filter(UniqueFragNum > 1000) %>%
+  ggplot(aes(x=Genotype, y=UniqueFragNum)) +
+  geom_violin(aes(fill = Genotype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, width = 0.5) +
+  ylab("Unique Fragments (log10 scale)") +
+  xlab("") +
+  scale_fill_manual(values = c("#ed2024", "#4e69b1")) +
+  #geom_jitter(aes(color = Genotype), position = position_jitter(0.15)) +
+  theme_classic() +
+  scale_y_continuous(transform = "log10") +
+  ggtitle("Unique Fragments") 
+
+scAlignFig <- bulk_alignResult %>%
+  dplyr::filter(AlignFragNum > 1000) %>%
+  ggplot(aes(x=Genotype, y=AlignFragNum)) +
+  geom_violin(aes(fill = Genotype)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.5, width = 0.5) +
+  ylab("Aligned Fragments (log10 scale)") +
+  xlab("") +
+  scale_fill_manual(values = c("#ed2024", "#4e69b1")) +
+  #geom_jitter(aes(color = Genotype), position = position_jitter(0.15)) +
+  theme_classic() +
+  scale_y_continuous(transform = "log10") +
+  ggtitle("Unique Fragments") 
+
+
+
+scFragFig
+scAlignFig
+```
+
+
+```{r Save Bulk Duplication Rate Figure}
+ggsave(filename = "scCnT_Picard_UniqueFragPerCell.pdf", 
+       plot = scFragFig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+ggsave(filename = "scCnT_Bowtie2_AlignFragPerCell.pdf", 
+       plot = scAlignFig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+```
+
+
+
+## Build batch files and remove duplicates again 
+
+```{cat Create script to remove dups from BAM files, engine.opts = list(file = 'scripts/5-build_batch_files.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=build_batch_files-okur # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=30 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# =============================================================================
+# BUILD BATCH FILES SCRIPT
+# =============================================================================
+# 
+# This script builds batch BAM files from single cell BAM files.
+# It creates two types of batch files for each batch:
+# 1. From deduplicated single cell files (*.rmDup.bam)
+# 2. From single cell files with duplicates present (*.bam)
+#
+# INPUT FILES:
+# - Single cell BAM files: *.hg38.bowtie2.bam (with duplicates present)
+# - Single cell BAM files: *.hg38.bowtie2.rmDup.bam (duplicates removed)
+#
+# OUTPUT FILE NAMING CONVENTIONS:
+# =============================================================================
+#
+# BATCH FILES (from deduplicated single cell files):
+# - *_batch{number}.hg38.bowtie2.bam
+#   → Single cell BAM files with duplicates removed, then combined into batches
+#   → Example: okur_batch1.hg38.bowtie2.bam (25 deduplicated files combined)
+#
+# BATCH FILES (from single cell files with duplicates present):
+# - *_batch{number}_withDups.hg38.bowtie2.bam
+#   → Single cell BAM files with duplicates present, combined into batches
+#   → Example: okur_batch1_withDups.hg38.bowtie2.bam (25 files with duplicates combined)
+#
+# BATCH STRUCTURE:
+# =============================================================================
+# - Batch 1: files 1-25 (25 files total)
+# - Batch 2: files 1-50 (50 files total, includes batch 1 + 25 more)
+# - Batch 3: files 1-75 (75 files total, includes batch 2 + 25 more)
+# - etc.
+#
+# =============================================================================
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+okurBamPath="${projPath}/alignment/bam/okur_bam"
+ociBamPath="${projPath}/alignment/bam/oci_bam"
+okurMergePath="${projPath}/alignment/bam/okur_merge"
+ociMergePath="${projPath}/alignment/bam/oci_merge"
+blacklistBed="${projPath}/ref_genomes/hg38-blacklist.v2.nochr.bed"
+
+# Create output directories
+mkdir -p "${okurMergePath}"
+mkdir -p "${ociMergePath}"
+
+# Check if blacklist BED file exists
+if [ ! -f "$blacklistBed" ]; then
+    echo "Error: Blacklist BED file not found: $blacklistBed"
+    exit 1
+fi
+
+# Load modules
+module load samtools
+module load bedtools2
+module load parallel
+
+# Function to process a single batch
+process_single_batch() {
+    local bam_dir=$1
+    local merge_dir=$2
+    local sample_prefix=$3
+    local batch_num=$4
+    local end_idx=$5
+    
+    echo "Processing batch $batch_num (files 1-$((end_idx + 1))) for $sample_prefix"
+    
+    local output_bam="${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.bam"
+    
+    # Read BAM files from the temporary file
+    local bam_files=($(cat "$bam_list_file"))
+    
+    # Create list of BAM files for this cumulative batch (files 0 to end_idx)
+    local batch_files=""
+    for ((i=0; i<=end_idx; i++)); do
+        batch_files="$batch_files ${bam_files[$i]}"
+    done
+    
+    # Merge BAM files for this batch (deduplicated files)
+    samtools merge -@ 5 "$output_bam" $batch_files
+    
+    if [ $? -eq 0 ]; then
+        echo "Successfully created batch $batch_num"
+        
+        # Sort the merged BAM file first
+        samtools sort -@ 5 -o "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.sorted.bam" "$output_bam"
+        
+        if [ $? -eq 0 ]; then
+            # Index the sorted BAM file
+            samtools index "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.sorted.bam"
+            
+            if [ $? -eq 0 ]; then
+                # Keep only standard chromosomes (1-22, X, Y) and exclude blacklisted regions
+                echo "Filtering chromosomes and blacklisted regions for batch $batch_num..."
+                echo "Using blacklist file: $blacklistBed"
+                
+                # First filter chromosomes, then filter blacklisted regions
+                samtools view -@ 5 -h -b "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.sorted.bam" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 X Y > "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.chr_filtered.bam"
+                
+                if [ $? -eq 0 ]; then
+                    bedtools intersect -v -abam "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.chr_filtered.bam" -b "$blacklistBed" > "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.filtered.bam"
+                    
+                    if [ $? -eq 0 ]; then
+                        # Clean up intermediate file
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.chr_filtered.bam"
+                        echo "Successfully filtered blacklisted regions for batch $batch_num"
+                    else
+                        echo "Error: bedtools intersect failed for batch $batch_num"
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.chr_filtered.bam"
+                        return 1
+                    fi
+                else
+                    echo "Error: samtools view failed for batch $batch_num"
+                    return 1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    # Sort the filtered BAM file to ensure proper coordinate sorting
+                    samtools sort -@ 5 -o "$output_bam" "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.filtered.bam"
+                    
+                    if [ $? -eq 0 ]; then
+                        # Clean up temporary filtered file
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.filtered.bam"
+                    else
+                        echo "Error sorting filtered batch $batch_num"
+                        return 1
+                    fi
+                else
+                    echo "Error filtering batch $batch_num"
+                    return 1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    # Index the final cleaned BAM file
+                    samtools index "$output_bam"
+                    
+                    if [ $? -ne 0 ]; then
+                        echo "Error indexing final batch $batch_num"
+                        return 1
+                    fi
+                    
+                    # Clean up temporary sorted file
+                    rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.sorted.bam"
+                    rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.sorted.bam.bai"
+                else
+                    echo "Error filtering chromosomes and blacklisted regions for batch $batch_num"
+                    return 1
+                fi
+            else
+                echo "Error indexing sorted batch $batch_num"
+                return 1
+            fi
+        else
+            echo "Error sorting batch $batch_num"
+            return 1
+        fi
+    else
+        echo "Error creating batch $batch_num"
+        return 1
+    fi
+    
+    # Also create batch from files with duplicates present (same batch number and file list)
+    local output_bam_with_dups="${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.hg38.bowtie2.bam"
+    
+    # Get the same single cell files but without rmDup suffix
+    local single_cell_files=""
+    for ((i=0; i<=end_idx; i++)); do
+        local single_cell_file=$(echo "${bam_files[$i]}" | sed 's/\.rmDup//')
+        single_cell_files="$single_cell_files $single_cell_file"
+    done
+    
+    # Merge BAM files for this batch (with duplicates)
+    samtools merge -@ 5 "$output_bam_with_dups" $single_cell_files
+    
+    if [ $? -eq 0 ]; then
+        echo "Successfully created batch $batch_num with duplicates"
+        
+        # Sort the merged BAM file first
+        samtools sort -@ 5 -o "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.sorted.bam" "$output_bam_with_dups"
+        
+        if [ $? -eq 0 ]; then
+            # Index the sorted BAM file
+            samtools index "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.sorted.bam"
+            
+            if [ $? -eq 0 ]; then
+                # Keep only standard chromosomes (1-22, X, Y) and exclude blacklisted regions
+                echo "Filtering chromosomes and blacklisted regions for batch $batch_num with duplicates..."
+                echo "Using blacklist file: $blacklistBed"
+                
+                # First filter chromosomes, then filter blacklisted regions
+                samtools view -@ 5 -h -b "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.sorted.bam" 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 X Y > "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.chr_filtered.bam"
+                
+                if [ $? -eq 0 ]; then
+                    bedtools intersect -v -abam "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.chr_filtered.bam" -b "$blacklistBed" > "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.filtered.bam"
+                    
+                    if [ $? -eq 0 ]; then
+                        # Clean up intermediate file
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.chr_filtered.bam"
+                        echo "Successfully filtered blacklisted regions for batch $batch_num with duplicates"
+                    else
+                        echo "Error: bedtools intersect failed for batch $batch_num with duplicates"
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.chr_filtered.bam"
+                        return 1
+                    fi
+                else
+                    echo "Error: samtools view failed for batch $batch_num with duplicates"
+                    return 1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    # Sort the filtered BAM file to ensure proper coordinate sorting
+                    samtools sort -@ 5 -o "$output_bam_with_dups" "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.filtered.bam"
+                    
+                    if [ $? -eq 0 ]; then
+                        # Clean up temporary filtered file
+                        rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.filtered.bam"
+                    else
+                        echo "Error sorting filtered batch $batch_num with duplicates"
+                        return 1
+                    fi
+                else
+                    echo "Error filtering batch $batch_num with duplicates"
+                    return 1
+                fi
+                
+                if [ $? -eq 0 ]; then
+                    # Index the final cleaned BAM file
+                    samtools index "$output_bam_with_dups"
+                    
+                    if [ $? -ne 0 ]; then
+                        echo "Error indexing final batch $batch_num with duplicates"
+                        return 1
+                    fi
+                    
+                    # Clean up temporary sorted file
+                    rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.sorted.bam"
+                    rm -f "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.sorted.bam.bai"
+                else
+                    echo "Error filtering chromosomes and blacklisted regions for batch $batch_num with duplicates"
+                    return 1
+                fi
+            else
+                echo "Error indexing sorted batch $batch_num with duplicates"
+                return 1
+            fi
+        else
+            echo "Error sorting batch $batch_num with duplicates"
+            return 1
+        fi
+    else
+        echo "Error creating batch $batch_num with duplicates"
+        return 1
+    fi
+    
+    echo "Completed batch $batch_num for $sample_prefix"
+}
+
+# Create a function for building batch BAM files using parallel processing
+build_batch_bams() {
+    local bam_dir=$1
+    local merge_dir=$2
+    local sample_prefix=$3
+    
+    echo "Building batch BAM files for: $bam_dir"
+    
+    # Get list of all BAM files in the directory (with duplicates removed)
+    local bam_files=($(ls "${bam_dir}"/*.hg38.bowtie2.rmDup.bam))
+    local total_files=${#bam_files[@]}
+    
+    if [ $total_files -eq 0 ]; then
+        echo "No BAM files found in $bam_dir"
+        return 1
+    fi
+    
+    echo "Found $total_files BAM files to process"
+    
+    # Calculate number of batches needed (25 files per batch)
+    local batch_size=25
+    local num_batches=$(( (total_files + batch_size - 1) / batch_size ))
+    
+    echo "Will create $num_batches cumulative batches using parallel processing"
+    
+    # Export necessary variables and function for parallel
+    export -f process_single_batch
+    export blacklistBed
+    
+    # Create a function to generate batch parameters
+    generate_batch_params() {
+        local bam_dir=$1
+        local merge_dir=$2
+        local sample_prefix=$3
+        local total_files=$4
+        local batch_size=25
+        local num_batches=$(( (total_files + batch_size - 1) / batch_size ))
+        
+        for ((batch=0; batch<num_batches; batch++)); do
+            local end_idx=$((batch * batch_size + batch_size - 1))
+            if [ $end_idx -ge $total_files ]; then
+                end_idx=$((total_files - 1))
+            fi
+            local batch_num=$((batch + 1))
+            echo "$bam_dir $merge_dir $sample_prefix $batch_num $end_idx"
+        done
+    }
+    
+    # Create a temporary file with the BAM file list for parallel processing
+    local bam_list_file="${merge_dir}/bam_files_list.txt"
+    printf '%s\n' "${bam_files[@]}" > "$bam_list_file"
+    
+    # Export necessary variables for parallel
+    export bam_list_file
+    export -f process_single_batch
+    
+    # Process batches in parallel (using 6 jobs to match the 30 CPUs)
+    generate_batch_params "$bam_dir" "$merge_dir" "$sample_prefix" "$total_files" | \
+    parallel -j 6 --colsep ' ' process_single_batch {1} {2} {3} {4} {5}
+    
+    # Clean up temporary file
+    rm -f "$bam_list_file"
+    
+    echo "Completed building batch BAM files for $bam_dir"
+}
+
+# Build batch BAM files for Okur samples
+echo "Building Okur batch BAM files..."
+build_batch_bams "$okurBamPath" "$okurMergePath" "okur"
+
+# Build batch BAM files for OCI samples
+# echo "Building OCI batch BAM files..."
+# build_batch_bams "$ociBamPath" "$ociMergePath" "oci"
+
+echo "All batch BAM files completed at $(date)"
+
+```
+
+```{bash Run Bam Split, engine.opts='-l'}
+sbatch scripts/5-build_batch_files.sh
+```
+
+
+
+```{cat Create script to remove dups from BAM files, engine.opts = list(file = 'scripts/6-process_duplicates.sh'}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=process_duplicates-okur # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=30 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# =============================================================================
+# PROCESS DUPLICATES SCRIPT
+# =============================================================================
+# 
+# This script processes batch BAM files to analyze biological duplicates.
+# It analyzes duplication patterns in both deduplicated and non-deduplicated batches.
+#
+# INPUT FILES (created by build_batch_files.sh):
+# - Batch BAM files: *_batch{number}.hg38.bowtie2.bam (deduplicated single cells combined)
+# - Batch BAM files: *_batch{number}_withDups.hg38.bowtie2.bam (single cells with duplicates combined)
+#
+# OUTPUT FILE NAMING CONVENTIONS:
+# =============================================================================
+#
+# DUPLICATE ANALYSIS OUTPUTS:
+# =============================================================================
+#
+# For deduplicated batches (*_batch{number}.hg38.bowtie2.bam):
+# - *_batch{number}.hg38.bowtie2.DupMark.bam
+#   → Picard duplicate-marked BAM file (should have low duplication)
+# - *_batch{number}.hg38.bowtie2.duplicates_only.bam
+#   → Only duplicate reads from deduplicated batch
+# - *_batch{number}.hg38.bowtie2.no_duplicates.bam
+#   → Only non-duplicate reads from deduplicated batch
+# - *_batch{number}_duplicate_metrics.txt
+#   → Picard duplicate statistics for deduplicated batch
+#
+# For batches with duplicates present (*_batch{number}_withDups.hg38.bowtie2.bam):
+# - *_batch{number}_withDups.noMT.bam
+#   → MT reads removed from batch with duplicates
+# - *_batch{number}_withDups.DupMark.bam
+#   → Picard marked duplicates on batch with duplicates (should show original duplication)
+# - *_batch{number}_withDups_duplicate_metrics.txt
+#   → Picard duplicate statistics for batch with duplicates
+#
+# PURPOSE:
+# =============================================================================
+# This analysis allows comparison of duplication rates between:
+# 1. Pre-combined single cell files (individual duplication rates)
+# 2. Post-combined batch files (batch-level duplication rates)
+# 3. Deduplicated vs. non-deduplicated approaches
+#
+# =============================================================================
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+okurBamPath="${projPath}/alignment/bam/okur_bam"
+ociBamPath="${projPath}/alignment/bam/oci_bam"
+okurMergePath="${projPath}/alignment/bam/okur_merge"
+ociMergePath="${projPath}/alignment/bam/oci_merge"
+picardMetricsPath="${projPath}/alignment/bam/picard_batch_metrics"
+
+# Create output directories
+mkdir -p "${picardMetricsPath}"
+
+# Load modules
+module load parallel
+module load picard
+module load samtools
+
+# Store the call for picard
+picardCMD="java -jar $PICARD"
+
+# Create a function for processing duplicates on a single batch
+process_batch_duplicates() {
+    local batch_bam=$1
+    local merge_dir=$2
+    local sample_prefix=$3
+    
+    # Extract batch number from filename
+    local batch_num=$(basename "$batch_bam" | sed 's/.*batch\([0-9]*\)\.hg38\.bowtie2\.bam/\1/')
+    
+    echo "Processing duplicates for batch $batch_num"
+    
+    # Check duplicates using Picard (MT and non-standard chromosomes already removed)
+    local metrics_file="${picardMetricsPath}/${sample_prefix}_batch${batch_num}_duplicate_metrics.txt"
+    
+    $picardCMD MarkDuplicates \
+        I="$batch_bam" \
+        O="${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.DupMark.bam" \
+        M="$metrics_file" \
+        REMOVE_DUPLICATES=false \
+        VALIDATION_STRINGENCY=SILENT
+        
+    if [ $? -eq 0 ]; then
+        echo "Successfully marked duplicates for batch $batch_num"
+        
+        # Index the duplicate-marked BAM
+        samtools index -@ 5 "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.DupMark.bam"
+        
+        # Create BAM with only duplicates
+        samtools view -@ 5 -h -b -f 0x400 "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.DupMark.bam" -o "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.duplicates_only.bam"
+        
+        # Create BAM with duplicates removed
+        samtools view -@ 5 -h -b -F 0x400 "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.DupMark.bam" -o "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.no_duplicates.bam"
+        
+        # Index both new BAM files
+        samtools index -@ 5 "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.duplicates_only.bam"
+        samtools index -@ 5 "${merge_dir}/${sample_prefix}_batch${batch_num}.hg38.bowtie2.no_duplicates.bam"
+        
+        echo "Completed batch $batch_num"
+    else
+        echo "Error processing duplicates for batch $batch_num"
+        return 1
+    fi
+}
+
+# Create a function for analyzing duplicates in batch files with duplicates present
+process_batch_duplicates_with_dups() {
+    local batch_bam=$1
+    local merge_dir=$2
+    local sample_prefix=$3
+    
+    # Extract batch number from filename
+    local batch_num=$(basename "$batch_bam" | sed 's/.*batch\([0-9]*\)_withDups\.hg38\.bowtie2\.bam/\1/')
+    
+    echo "Analyzing duplicates for batch $batch_num (with duplicates present)"
+    
+    # Check duplicates using Picard (MT and non-standard chromosomes already removed)
+    local metrics_file="${picardMetricsPath}/${sample_prefix}_batch${batch_num}_withDups_duplicate_metrics.txt"
+    
+    $picardCMD MarkDuplicates \
+        I="$batch_bam" \
+        O="${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.DupMark.hg38.bowtie2.bam" \
+        M="$metrics_file" \
+        REMOVE_DUPLICATES=false \
+        VALIDATION_STRINGENCY=SILENT
+    
+    if [ $? -eq 0 ]; then
+        echo "Successfully marked duplicates for batch $batch_num (with duplicates present)"
+        
+        # Index the duplicate-marked BAM
+        samtools index -@ 5 "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.DupMark.hg38.bowtie2.bam"
+        
+        # Create BAM with only duplicates
+        samtools view -@ 5 -h -b -f 0x400 "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.DupMark.hg38.bowtie2.bam" -o "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.DupMark.hg38.bowtie2.allDuplicates_only.bam"
+        
+        # Index both new BAM files
+        samtools index -@ 5 "${merge_dir}/${sample_prefix}_batch${batch_num}_withDups.DupMark.hg38.bowtie2.allDuplicates_only.bam"
+        
+        echo "Completed batch $batch_num (with duplicates present)"
+    else
+        echo "Error processing duplicates for batch $batch_num (with duplicates present)"
+        return 1
+    fi
+}
+
+# Export functions and variables for parallel
+export -f process_batch_duplicates process_batch_duplicates_with_dups
+export okurBamPath ociBamPath okurMergePath ociMergePath picardMetricsPath picardCMD
+
+# Process duplicates in parallel for Okur samples
+#echo "Processing Okur duplicates in parallel..."
+#cd $okurMergePath
+#ls *okur_batch[0-9]*.hg38.bowtie2.bam | grep -v "_withDups" | parallel -j 6 process_batch_duplicates {} $okurMergePath "okur"
+
+# Process duplicates in parallel for OCI samples
+#echo "Processing OCI duplicates in parallel..."
+#cd $ociMergePath
+#ls *oci_batch[0-9]*.hg38.bowtie2.bam | grep -v "_withDups" | parallel -j 6 process_batch_duplicates {} $ociMergePath "oci"
+
+# Process duplicates in parallel for Okur samples (with duplicates present)
+echo "Processing Okur duplicates with duplicates present in parallel..."
+cd $okurMergePath
+ls *okur_batch*_withDups.hg38.bowtie2.bam | parallel -j 6 process_batch_duplicates_with_dups {} $okurMergePath "okur"
+
+# Process duplicates in parallel for OCI samples (with duplicates present)
+echo "Processing OCI duplicates with duplicates present in parallel..."
+cd $ociMergePath
+ls *oci_batch*_withDups.hg38.bowtie2.bam | parallel -j 6 process_batch_duplicates_with_dups {} $ociMergePath "oci"
+
+echo "All biological duplicate processing completed at $(date)"
+```
+
+```{bash Run Bam Split, engine.opts='-l'}
+sbatch scripts/6-process_duplicates.sh
+```
+
+
+## Create Sample Lists and Reading Data into R
+
+Before we create sample lists let's load the necessary R packages.
+```{r Load R Packages, echo=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(viridis)
+library(corrplot)
+library(GenomicRanges)
+library(Rsamtools)
+library(ggpmisc)
+library(ggbreak)
+```
+
+
+Read the sample list text files into R
+```{r Read Sample Lists into R}
+picard_files <- sapply(
+                       strsplit(list.files(path = picard_dir, pattern = "_duplicate_metrics.txt"), "_"),
+                       function(x) paste(x[1:2], collapse="_")
+                       ) %>% unique()
+```
+
+
+
+
+##Summarize Duplicate Information from Picard
+
+We now have the sequencing depth and alignment rates for each of our samples... but how many of the paired end reads are duplicates? We can find this out by looking at the Picard reports.
+```{r Summarize Picard Duplicates for Bulk Samples}
+bulk_dupResult <- c()
+
+for(hist in picard_files){
+  
+  bioDupRes = read.table(file.path(picard_dir, paste0(hist, "_duplicate_metrics.txt")), header = TRUE, fill = TRUE)
+  
+  dupRes = read.table(file.path(picard_dir, paste0(hist, "_withDups_duplicate_metrics.txt")), header = TRUE, fill = TRUE)
+  
+  histInfo = strsplit(hist, "_")[[1]]
+  
+  bulk_dupResult = data.frame(Genotype = paste0(histInfo[1]),
+                              Batch = gsub("batch", "", histInfo[2]) %>% as.numeric,
+                              AlignFragNum = dupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric,
+                              BiologicalFragNum = bioDupRes$READ_PAIRS_EXAMINED[1] %>% as.character %>% as.numeric, 
+                              DuplicateFragNum = dupRes$READ_PAIR_DUPLICATES[1] %>% as.character %>% as.numeric,
+                              BiologicalDuplicateFragNum = bioDupRes$READ_PAIR_DUPLICATES[1],
+                              DuplicationRate = dupRes$PERCENT_DUPLICATION[1]  %>% as.character %>% as.numeric * 100,
+                              BiologicalDuplicationRate = bioDupRes$PERCENT_DUPLICATION[1] %>% as.character %>% as.numeric * 100,
+                              EstimatedLibrarySize = dupRes$ESTIMATED_LIBRARY_SIZE[1] %>% as.character %>% as.numeric
+                              ) %>%
+                              dplyr::mutate(UniqueBiologicalFragNum = BiologicalFragNum * (1-BiologicalDuplicationRate/100),
+                                     UniqueFragNum = AlignFragNum * (1-DuplicationRate/100)) %>%
+                              dplyr::mutate(SequencingSaturation = UniqueFragNum / EstimatedLibrarySize) %>%
+                                      rbind(bulk_dupResult, .)
+}
+
+bulk_dupResult$Genotype <- factor(bulk_dupResult$Genotype)
+
+bulk_dupResult <- bulk_dupResult %>%
+  dplyr::mutate(CellNum = Batch * 25,
+                Target = if_else(Genotype == "okur", "H3K27me3", "RAD21"))
+
+```
+
+
+
+```{r}
+# Save the bulk_alignDupSummary dataframes as an rds object.
+saveRDS(bulk_dupResult,
+        file = "duplicateSummary.rds")
+
+# Read the RDS file 
+bulk_dupResult <- readRDS("duplicateSummary.rds")
+```
+
+
+```{r plot oci histogram for batch 61}
+ociHistRes <- read.table(file.path(picard_dir, paste0("oci_batch61_duplicate_metrics.txt")), header = TRUE, fill = TRUE) %>%
+  dplyr::select(1:4) %>%
+  rownames_to_column(var = "Bin") 
+
+colnames(ociHistRes) <- ociHistRes[2,]
+
+ociHistRes <- ociHistRes %>% dplyr::filter(BIN != "BIN" & BIN != "Unknown") %>%
+  dplyr::mutate(non_optical_sets = as.numeric(non_optical_sets),
+                BIN = as.numeric(BIN))
+
+
+oci_hist_fig <- ociHistRes %>%
+  dplyr::filter(BIN < 10) %>%
+  ggplot(aes(x=BIN, y=non_optical_sets)) +
+  geom_col(fill = "#4e69b1", alpha = 0.7) +
+  labs(x = "Bins", y = "Non-optical Sets") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_break(c(160000, 4.62e6)) +
+  theme_classic() 
+
+oci_hist_fig
+```
+
+```{r plot okur histogram for batch 37}
+okurHistRes <- read.table(file.path(picard_dir, paste0("okur_batch37_duplicate_metrics.txt")), header = TRUE, fill = TRUE) %>%
+  dplyr::select(1:4) %>%
+  rownames_to_column(var = "Bin") 
+
+colnames(okurHistRes) <- okurHistRes[2,]
+
+okurHistRes <- okurHistRes %>% dplyr::filter(BIN != "BIN" & BIN != "Unknown") %>%
+  dplyr::mutate(non_optical_sets = as.numeric(non_optical_sets),
+                BIN = as.numeric(BIN))
+
+
+okur_hist_fig <- okurHistRes %>%
+  dplyr::filter(BIN < 6) %>%
+  ggplot(aes(x=BIN, y=non_optical_sets)) +
+  geom_col(fill = "#ed2024", alpha = 0.7) +
+  labs(x = "Bins", y = "Non-optical Sets") +
+  scale_x_continuous(breaks = 1:10) +
+  scale_y_break(c(7500, 6.62e6)) +
+  theme_classic() 
+
+okur_hist_fig
+```
+
+
+
+```{r save histogram figures}
+ggsave(filename = "scCnT_Picard_Histogram_RAD21.pdf", 
+       plot = oci_hist_fig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+ggsave(filename = "scCnT_Picard_Histogram_H3K27me3.pdf", 
+       plot = okur_hist_fig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+## Graph duplicate infor
+
+This is a good plot for demonstrating the difference in biological duplicates for H3K27me3 vs RAD21
+```{r Graph bulk alignment & duplication}
+dupFig1a <- bulk_dupResult %>%
+  #dplyr::filter(!(Target == "H3K27me3")) %>%
+  ggplot(aes(x = CellNum, y = BiologicalDuplicateFragNum, colour = Target)) +
+  #geom_line() +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se=TRUE) +
+  geom_point(size=1) +
+  ylab("Biological Duplicates") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("Biological Duplicates") +
+  stat_poly_eq(aes(label = after_stat(eq.label)), 
+               formula = y ~ poly(x, 2, raw = TRUE), 
+               parse = TRUE, 
+               size = 3,
+               label.x = 0.05, 
+               label.y = c(0.95, 0.85))
+
+dupFig1b <- bulk_dupResult %>%
+  ggplot(aes(x = CellNum, y = BiologicalDuplicateFragNum, colour = Target)) +
+  #geom_line() +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se=TRUE) +
+  geom_point(size = 1) +
+  ylab("Biological Duplicates") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+        plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  coord_cartesian(xlim = c(1,1000), ylim = c(0,7500)) +
+  guides(fill="none") +
+  ggtitle("Biological Duplicates") +
+  stat_poly_eq(aes(label = after_stat(eq.label)), 
+               formula = y ~ poly(x, 2, raw = TRUE), 
+               parse = TRUE, 
+               size = 3,
+               label.x = 0.05, 
+               label.y = c(0.95, 0.85))
+
+dupFig1c <- bulk_dupResult %>%
+  ggplot(aes(x = CellNum, y = BiologicalDuplicateFragNum + UniqueBiologicalFragNum, colour = Target)) +
+  geom_line() +
+  geom_point(size = 1) +
+  ylab("Biological Fragments") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+        plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  #coord_cartesian(xlim = c(1,1000), ylim = c(0,7500)) +
+  guides(fill="none") +
+  ggtitle("Biological Fragments")
+
+
+dupFig1d <- bulk_dupResult %>%
+  ggplot(aes(x = CellNum, y = EstimatedLibrarySize, colour = Target)) +
+  geom_line() +
+  geom_point(size = 1) +
+  ylab("Estimated Library Size") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+        plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  #coord_cartesian(xlim = c(1,1000), ylim = c(0,7500)) +
+  guides(fill="none") +
+  ggtitle("Estimated Library Size")
+
+
+dupFig1e <- bulk_dupResult %>%
+  ggplot(aes(x = CellNum, y = AlignFragNum, colour = Target)) +
+  geom_line() +
+  geom_point(size = 1) +
+  ylab("Aligned Fragments") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+        plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  #coord_cartesian(xlim = c(1,1000), ylim = c(0,7500)) +
+  guides(fill="none") +
+  ggtitle("Aligned Fragments")
+
+dupFig1a
+dupFig1b
+dupFig1c
+dupFig1d
+dupFig1e
+```
+
+
+
+```{r Graph bulk alignment & duplication}
+dupFig1c <- bulk_dupResult %>%
+  #dplyr::filter(!(Target == "H3K27me3")) %>%
+  ggplot(aes(x = CellNum, y = DuplicateFragNum, colour = Target)) +
+  geom_line() +
+  geom_point() +
+  ylab("All Duplicates") +
+  xlab("") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("Duplicate Fragment Number")
+
+
+dupFig1c
+```
+
+
+```{r Save Bulk Duplication Rate Figure}
+ggsave(filename = "scCnT_Picard_AllDups-vs-nCell_RAD21-H3K27me3.pdf", 
+       plot = dupFig1a, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+```
+
+
+
+
+This is a good plot for demonstrating the difference in biological duplicates for H3K27me3 vs RAD21
+```{r Graph precentage of duplicates that are biological}
+dupFig2a <- bulk_dupResult %>%
+  #dplyr::filter(!(Target == "H3K27me3")) %>%
+  ggplot(aes(x = CellNum, y = BiologicalDuplicateFragNum/DuplicateFragNum * 100, colour = Target)) +
+  #geom_line() +
+  geom_smooth(method = "lm") + 
+  geom_point(size=1) +
+  ylab("Biological Duplicates") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("Duplicated Biological Fragments") +
+  stat_poly_eq(aes(label = after_stat(eq.label)), 
+               formula = y ~ x, 
+               parse = TRUE, 
+               size = 3,
+               label.x = 0.05, 
+               label.y = c(0.95, 0.85))
+
+
+dupFig2b <- bulk_dupResult %>%
+  ggplot(aes(x = CellNum, y = BiologicalDuplicateFragNum/DuplicateFragNum * 100, colour = Target)) +
+  #geom_line() +
+  geom_smooth(method = "lm") + 
+  geom_point(size = 1) +
+  ylab("Biological Duplicates (%)") +
+  xlab("Number of Cells") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), 
+        plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  coord_cartesian(xlim = c(1,1000), ylim = c(0,0.015)) +
+  guides(fill="none") +
+  ggtitle("H3K27me3 - Biological Duplicates") 
+
+dupFig2a
+dupFig2b
+```
+
+
+
+
+
+```{r Save Bulk Duplication Rate Figure}
+ggsave(filename = "scCnT_Picard_PercentBiologicalDups-vs-nCell_RAD21-H3K27me3.pdf", 
+       plot = dupFig2a, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+```
+
+
+This demonstrates the greater library diversity of H3K27me3 data
+```{r Graph bulk alignment & duplication}
+dupFig2a <- bulk_dupResult %>%
+  #dplyr::filter(!(Target == "H3K27me3")) %>%
+  ggplot(aes(x = CellNum, y = EstimatedLibrarySize, colour = Target)) +
+  geom_line() +
+  geom_point() +
+  ylab("Estimated Library Size") +
+  xlab("") +
+  theme_classic() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("RAD21 - Estimated Library Size")
+
+
+dupFig2a
+```
+
+
+```{r Plot Aligned Frags}
+dupFig3a <- bulk_dupResult %>%
+  #dplyr::filter(!(Target == "H3K27me3")) %>%
+  ggplot(aes(y = BiologicalDuplicateFragNum, x =EstimatedLibrarySize, colour = Target)) +
+  geom_line() +
+  geom_point() +
+  ylab("Biological Duplicates") +
+  xlab("Estimated Library Size") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("RAD21 - Estimated Library Size")
+
+dupFig3b <- bulk_dupResult %>%
+  dplyr::filter((Target == "H3K27me3")) %>%
+  ggplot(aes(x = EstimatedLibrarySize, y = BiologicalDuplicationRate, colour = Target)) +
+  geom_line() +
+  geom_point() +
+  ylab("Duplication Rate (%)") +
+  xlab("Estimated Library Size") +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
+  guides(fill="none") +
+  ggtitle("H3K27me3 - Estimated Library Size")
+
+dupFig3a
+dupFig3b
+
+```
+
+
+## Read in bulk data to get estimated library size
+
+```{r}
+dupResult <- read_rds(file = "/scratch/g/srrao/josiah_ociaml3/josiah_ociaml3_cutandtag/alignSummary.rds")
+
+bulkfig1a <- dupResult %>%
+  dplyr::filter(Genotype == "NTC") %>%
+  dplyr::filter(Target == "RAD21" | Target == "H3K27me3") %>%
+  dplyr::filter(grepl("A|B", Replicate)) %>%
+  ggplot(aes(x=Target, y=Hg38_EstimatedLibrarySize)) +
+  geom_boxplot(aes(colour = Target)) +
+  geom_point() +
+  scale_color_manual(values = c("#ed2024", "#4e69b1")) +
+  scale_y_continuous(breaks = c(20e6,40e6,60e6,80e6,100e6), 
+                     labels = c("20","40","60","80","100")) +
+  labs(x="", y="Estimated Library Size (x10^6)") +
+  theme_minimal()
+
+bulkfig1a
+```
+
+```{r Save Bulk Duplication Rate Figure}
+ggsave(filename = "scCnT_BulkSamples_EstLibSize.pdf", 
+       plot = bulkfig1a, 
+       width = 4, 
+       height = 2.5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+```
+
+##Print session info
+```{r session info}
+sessionInfo()
+```
+

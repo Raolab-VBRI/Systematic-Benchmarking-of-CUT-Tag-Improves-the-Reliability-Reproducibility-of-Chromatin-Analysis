@@ -1,0 +1,625 @@
+---
+title: "3-CUTandTag-Make_your_Bam_Bed"
+output: html_document
+date: "2023-07-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.keep = 'last')
+```
+
+ 
+Begin by creating loading required libraries and creating enviromental variables.
+
+```{r Create Enviromental Variables}
+figure_dir <- file.path("figures")
+
+bed_dir <- file.path("alignment", "bed")
+
+if (!(dir.exists(figure_dir))){
+  dir.create(figure_dir)
+}
+```
+
+
+
+## Convert bam files to bed files
+bam files are great for igv viewing but, bed files are needed to create BigWig files which will be our best option for looking at 1000's of single cells in IGV or UCSC. In order to create scaled bedgraph files we will need to have a file with the chromosome sizes for hg38. We can generate this using samtools faidx.
+```{bash, engine.opts='-l'}
+gzip -d ref_genomes/bowtie_hg38_index/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+module load samtools
+
+samtools faidx ref_genomes/bowtie_hg38_index/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+
+gzip ref_genomes/bowtie_hg38_index/Homo_sapiens.GRCh38.dna.primary_assembly.fa
+```
+
+
+Lets create a bash script that can convert our bam files into bed files.
+```{cat Create bed Script, engine.opts = list(file = 'scripts/7-bedCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bedCreation # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-12:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=24 # number of threads
+#SBATCH --mem-per-cpu=7gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bamPath="${projPath}/alignment/bam/bulk_bam"
+bedPath="${projPath}/alignment/bed"
+
+mkdir -p $bedPath
+
+# Load packages
+module load samtools
+module load bedtools2
+module load parallel
+
+
+# Function to process BAM to BED conversion
+process_bam_to_bed() {
+    local i=$1
+    # First drop unaligned reads using samtools view
+    # Next use samtools to sort reads by name, then convert to bed via bedtools
+    # Use awk to keep read pairs that are on the same chromosome and map within 1000bp of each other
+    samtools view -@ 4 -h -F 4 $bamPath/"$i".hg38.bowtie2.bam \
+    | samtools sort -n -@ 4 - \
+    | bedtools bamtobed -bedpe \
+    | awk '$1==$4 && $6-$2 < 1000 {print $0}' > $bedPath/"$i".bowtie2.clean.bed
+    
+    
+}
+
+
+# Function to process BED to fragments
+process_bed_to_fragments() {
+    local i=$1
+    # Extract the fragment related columns with cut
+    cut -f 1,2,6 $bedPath/"$i".bowtie2.clean.bed \
+    | sort -k1,1 -k2,2n -k3,3n > $bedPath/"$i".bowtie2.fragments.bed
+}
+
+# Export functions and variables for parallel
+export -f process_bam_to_bed process_bed_to_fragments
+export bamPath bedPath
+
+
+cd $bamPath
+
+# Process BAM files in parallel (using 6 jobs at once = 24 total cores with 4 cores each)
+ls *.hg38.bowtie2.bam | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bam_to_bed {}
+
+cd $bedPath
+
+# Process BED files in parallel
+ls *.bowtie2.clean.bed | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bed_to_fragments {}
+
+```
+
+
+Now we can submit the bedCreation script to SLURM on RCC
+```{bash Submit bam to bed script to SLURM, engine.opts='-l'}
+sbatch scripts/7-bedCreation.sh
+```
+
+## Convert bed files to bedgraph files
+
+```{cat Create bed Script, engine.opts = list(file = 'scripts/8-bedgraphCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bedgraph # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-02:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=24 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# load modules
+module load bedtools2
+module load parallel
+
+# set up directories
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bedPath="${projPath}/alignment/bed"
+bedgraphPath="${projPath}/alignment/bedgraph"
+
+chromSize="${projPath}/ref_genomes/Homo_sapiens.GRCh38.dna.primary_assembly.fa.fai"
+
+mkdir -p "${bedgraphPath}"
+
+
+
+# Function to process BED to BEDgraph conversion
+process_bed_to_bedgraph() {
+    local i=$1
+    bedtools genomecov -bg -i "$i".bowtie2.fragments.bed -g $chromSize \
+    >$bedgraphPath/"$i".bowtie2.fragments.bedgraph
+}
+
+# Export functions and variables for parallel
+export -f process_bed_to_bedgraph
+export bedPath bedgraphPath chromSize 
+
+# Go to bed directory
+cd ${bedPath}
+
+# Process BED files in parallel (using 6 jobs at once = 24 total cores with 4 cores each)
+ls *.bowtie2.fragments.bed | cut -d . -f 1 | sort | uniq | parallel -j 6 process_bed_to_bedgraph {}
+
+
+echo "Done Creating Bedgraph files"
+```
+
+
+```{bash Submit bam to bed script to SLURM, engine.opts='-l'}
+sbatch scripts/8-bedgraphCreation.sh
+```
+
+## Generate BigWig Files for IGV viewing
+
+DeepTools can generate BigWig files from our Bed Files.
+
+```{cat Create bigwig Script, engine.opts = list(file = 'scripts/9-bigwigCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bigwig_convert # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 1-00:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=32 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send updates to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load deeptools
+module load samtools
+module load parallel
+
+
+# Set paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bamPath="${projPath}/alignment/bam/bulk_bam"
+bigWigPath="${projPath}/alignment/bigwig"
+
+# Create output directories if they don't exist
+mkdir -p "$bigWigPath"
+
+# Function to process a single BAM file
+process_bam() {
+    local bamFile="$1"
+    local bigWigPath="$2"
+    
+    # Extract sample name from BAM filename
+    local sampleName=$(basename "$bamFile" .hg38.bowtie2.sorted.bam)
+    
+    # Run bamCoverage with custom scaling factor
+    bamCoverage \
+        --bam "$bamFile" \
+        --outFileName "${bigWigPath}/${sampleName}.bw" \
+        --scaleFactor 1 \
+        --binSize 5 \
+        --smoothLength 15 \
+        --numberOfProcessors 8 \
+        --extendReads
+    
+    # Check if conversion was successful
+    if [ $? -eq 0 ]; then
+        echo "Successfully created normalized BigWig file for $sampleName"
+        return 0
+    else
+        echo "Error: Failed to create BigWig file for $sampleName"
+        return 1
+    fi
+}
+
+# Export the function so it can be used by parallel
+export -f process_bam
+
+# Process BAM files in parallel
+echo "Starting parallel processing of BAM files..."
+find "${bamPath}" -name "*.hg38.bowtie2.bam" | \
+    parallel --jobs 4 \
+    process_bam {} "${bigWigPath}"
+
+
+echo "Finished processing all files at $(date)"
+```
+
+Now we can submit the bedCreation script to SLURM on RCC
+```{bash Submit bam to bed script to SLURM, engine.opts='-l'}
+sbatch scripts/9-bigwigCreation.sh
+```
+
+## Generate binned bed files
+
+```{cat Create Script for 1000 bp binned bed files, engine.opts = list(file = 'scripts/13-binnedBedCreation.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=binnedBedCreation # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-05:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=20 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send notifications to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load required modules
+module load parallel
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bedPath="${projPath}/alignment/bed"
+binLen=1000
+
+
+
+cd ${bedPath}
+
+# Function to process a single BED file
+process_bed_file() {
+    local sample_name="$1"
+    local binLen="$2"
+    
+    echo "Processing $sample_name at $(date)"
+    
+    # Process the BED file to create binned fragment counts:
+    # Step 1: Calculate center of each fragment and round to nearest bin
+    #         Input: chr start end -> Output: chr bin_center
+    # Step 2: Sort by chromosome and bin position for uniq to work properly
+    # Step 3: Count fragments per bin
+    #         Output: count chr bin_position
+    # Step 4: Format as BED file with count in 4th column
+    #         Reorder: chr bin_position count -> chr start end count
+    # Step 5: Final sort to ensure proper BED format ordering
+    awk -v w=$binLen '{print $1, int(($2 + $3)/(2*w))*w + w/2}' \
+        "${sample_name}.bowtie2.fragments.bed" | \
+        sort -k1,1V -k2,2n | \
+        uniq -c | \
+        awk -v OFS="\t" '{print $2, $3, $1}' | \
+        sort -k1,1V -k2,2n > \
+        "${sample_name}.bowtie2.fragmentsCount.bin${binLen}.bed"
+    
+    if [ $? -eq 0 ]; then
+        echo "Successfully processed $sample_name at $(date)"
+    else
+        echo "Error processing $sample_name at $(date)"
+        return 1
+    fi
+}
+
+# Export the function and variables so they can be used by parallel
+export -f process_bed_file
+export binLen
+
+# Get list of sample names from BED files
+sample_list=($(ls *.bowtie2.fragments.bed | cut -d . -f 1 | sort | uniq))
+
+echo "Found ${#sample_list[@]} samples to process: ${sample_list[*]}"
+echo "Starting parallel processing with ${SLURM_CPUS_ON_NODE} CPUs..."
+
+# Process samples in parallel (using all available CPUs)
+printf '%s\n' "${sample_list[@]}" | \
+    parallel --jobs ${SLURM_CPUS_ON_NODE} \
+    process_bed_file {} "${binLen}"
+
+echo "Finished processing all samples at $(date)"
+
+```
+
+Now we can submit the bin script to SLURM on RCC
+```{bash Submit binned bed script to SLURM, engine.opts='-l'}
+sbatch scripts/13-binnedBedCreation.sh
+```
+
+
+
+## Plot bin bias of duplicates
+
+```{r Load Libraries}
+library(ggplot2)
+library(dplyr)
+library(corrplot)
+library(tidyr)
+library(readr)
+```
+
+```{r}
+sample_list <- list.files(pattern = "bin1000.bed",
+             path = bed_dir) %>%
+             sub("\\..*", "", .)
+```
+
+
+Take the 1,000 bp binned bed files and calculate Pearson's correlation values
+```{r Calculating Pearsons Correlation Values for Bulk Samples with Duplicates}
+bulkFragCount = NULL
+for(hist in sample_list){
+  
+  if(is.null(bulkFragCount)){
+    
+    bulkFragCount = read.table(paste0("alignment/", "bed/", hist, ".bowtie2.fragmentsCount.bin1000.bed"), header = FALSE) 
+    colnames(bulkFragCount) = c("chrom", "bin", hist)
+    
+  }else{
+    
+    fragCountTmp = read.table(paste0("alignment/", "bed/", hist, ".bowtie2.fragmentsCount.bin1000.bed"), header = FALSE)
+    colnames(fragCountTmp) = c("chrom", "bin", hist)
+    bulkFragCount = dplyr::full_join(bulkFragCount, fragCountTmp, by = c("chrom", "bin"))
+    
+  }
+}
+```
+
+
+```{r}
+# Function to analyze top bins overlap between columns
+analyze_top_bins_overlap <- function(frag_count_data, 
+                                   reference_column, 
+                                   max_percentile = 25, 
+                                   step_size = 1,
+                                   create_plots = TRUE) {
+  
+  # Load required libraries
+  library(ggplot2)
+  library(dplyr)
+  
+  # Calculate percentiles
+  min_percentile <- 100 - max_percentile
+  percentiles <- seq(min_percentile/100, 0.99, by = step_size/100)
+  thresholds <- quantile(frag_count_data[[reference_column]], percentiles, na.rm = TRUE)
+  
+  # Get row indices for each percentile bin
+  bin_indices <- lapply(thresholds, function(thresh) {
+    which(frag_count_data[[reference_column]] >= thresh)
+  })
+  
+  # Calculate percentage of reads from all columns (including reference) that fall into each bin range
+  all_columns <- names(frag_count_data)
+  
+  # Create results dataframe for all percentiles
+  results_list <- list()
+  
+  for(i in 1:length(percentiles)) {
+    percentile_val <- max_percentile - (i - 1) * step_size  # Calculate actual percentile based on step_size
+    current_bins <- bin_indices[[i]]
+    
+    if(length(current_bins) > 0) {
+      results_list[[i]] <- data.frame(
+        percentile = percentile_val,
+        column = all_columns,
+        total_reads = sapply(all_columns, function(col) sum(frag_count_data[[col]], na.rm = TRUE)),
+        reads_in_bins = sapply(all_columns, function(col) sum(frag_count_data[[col]][current_bins], na.rm = TRUE)),
+        threshold = thresholds[i],
+        n_bins = length(current_bins)
+      ) %>%
+        mutate(
+          percentage_in_bins = (reads_in_bins / total_reads) * 100
+        )
+    }
+  }
+  
+  # Combine all results
+  final_results <- do.call(rbind, results_list)
+  
+  print(paste("Summary of top 1-", max_percentile, "% bin analysis using reference column:", reference_column))
+  print(final_results)
+  
+  if(create_plots) {
+    # Plot 1: Percentage of reads in top bins by percentile
+    p1 <- ggplot(final_results, aes(x = percentile, y = percentage_in_bins, color = column)) +
+      geom_line(size = 1) +
+      geom_point(size = 2) +
+      labs(
+        title = paste("Percentage of Reads in Top Bins by Percentile (Reference:", reference_column, ")"),
+        x = "Top Percentile (%)",
+        y = "Percentage of Reads in Bins (%)",
+        color = "Column"
+      ) +
+      theme_minimal() +
+      theme(legend.position = "bottom") +
+      scale_x_continuous(breaks = seq(1, max_percentile, by = max(1, floor(max_percentile/10))))
+    
+    print(p1)
+    
+    # Plot 2: Number of bins by percentile
+    p2 <- ggplot(final_results, aes(x = percentile, y = n_bins)) +
+      geom_line(size = 1, color = "blue") +
+      geom_point(size = 2, color = "blue") +
+      labs(
+        title = paste("Number of Bins by Top Percentile (Reference:", reference_column, ")"),
+        x = "Top Percentile (%)",
+        y = "Number of Bins"
+      ) +
+      theme_minimal() +
+      scale_x_continuous(breaks = seq(1, max_percentile, by = max(1, floor(max_percentile/10))))
+    
+    print(p2)
+    
+    # Plot 3: Heatmap of percentages
+    p3 <- ggplot(final_results, aes(x = percentile, y = column, fill = percentage_in_bins)) +
+      geom_tile() +
+      scale_fill_gradient(low = "white", high = "red", name = "Read %") +
+      labs(
+        title = paste("Heatmap: Percentage of Reads in Top Bins (Reference:", reference_column, ")"),
+        x = "Top Percentile (%)",
+        y = "Column"
+      ) +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 0)) +
+      scale_x_continuous(breaks = seq(1, max_percentile, by = max(1, floor(max_percentile/10))))
+    
+    print(p3)
+  }
+  
+  return(final_results)
+}
+```
+
+
+
+```{r}
+okur_FragCount <- bulkFragCount %>%
+    dplyr::select(contains("okur_H3K27me3-batch37")) %>%
+    mutate(across(everything(), ~ replace_na(., 0)))
+
+oci_FragCount <- bulkFragCount %>%
+    dplyr::select(contains("NTC_RAD21-batch")) %>%
+    mutate(across(everything(), ~ replace_na(., 0)))
+
+# Run the analysis
+okur_results <- analyze_top_bins_overlap(
+  frag_count_data = okur_FragCount,
+  reference_column = "okur_H3K27me3-batch37_R1-biological",
+  max_percentile = 30,
+  step_size = 1,
+  create_plots = TRUE)
+
+oci_results <- analyze_top_bins_overlap(
+  frag_count_data = oci_FragCount,
+  reference_column = "NTC_RAD21-batch61_A-biological",
+  max_percentile = 30,
+  step_size = 1,
+  create_plots = TRUE)
+```
+
+
+```{r}
+okur_binFig <- okur_results %>%
+  dplyr::mutate(condition = case_when(
+    grepl("biological", column) ~ "All biological fragments",
+    grepl("AllDupsOnlyDups", column) ~ "All Duplicates",
+    grepl("OnlyDups", column) ~ "Biological Duplicates",
+    grepl("withDups", column) ~ "All Fraggments",
+    grepl("rmDup", column) ~ "Deduplicated Fragments"
+  )) %>%
+  dplyr::filter(!is.na(condition)) %>%
+  ggplot(aes(x=percentile, y=percentage_in_bins, colour = condition)) +
+  geom_line(position = position_dodge(width = 0.3)) +
+  geom_point(position = position_dodge(width = 0.3)) +
+  scale_colour_manual(values = c("#f78c21", "black", "#987e54", "#4f6ab2", "#0e8241")) +
+  labs(x="Top Percentile Bins (%)", y="Percent of Total Reads in Bins") +
+  theme_minimal()
+
+oci_binFig <- oci_results %>%
+  dplyr::mutate(condition = case_when(
+    grepl("biological", column) ~ "All biological fragments",
+    grepl("AllDupsOnlyDups", column) ~ "All Duplicates",
+    grepl("OnlyDups", column) ~ "Biological Duplicates",
+    grepl("withDups", column) ~ "All Fraggments",
+    grepl("rmDup", column) ~ "Deduplicated Fragments"
+  )) %>%
+  dplyr::filter(!is.na(condition)) %>%
+  ggplot(aes(x=percentile, y=percentage_in_bins, colour = condition)) +
+  geom_line() +
+  geom_point(position = position_dodge(width = 0.3)) +
+  scale_colour_manual(values = c("#f78c21", "black", "#987e54", "#4f6ab2", "#0e8241")) +
+  labs(x="Top Percentile Bins (%)", y="Percent of Total Reads in Bins") +
+  theme_minimal()
+
+okur_binFig
+oci_binFig
+```
+
+```{r}
+ggsave(filename = "scCnT_Bins_Okur-FragmentsPerBin.pdf", 
+       plot = okur_binFig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+ggsave(filename = "scCnT_Bins_OCI-FragmentsPerBin.pdf", 
+       plot = oci_binFig, 
+       width = 6, 
+       height = 4,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+
+
+
+```{r}
+okur_FragCount %>%
+  ggplot(aes(x=`okur_H3K27me3-batch37_R1-biological`, y=`okur_H3K27me3-batch37_R1-rmDup`)) +
+  geom_point()
+
+oci_FragCount %>%
+  ggplot(aes(x=log2(`NTC_RAD21-batch61_A-biological`+0.1), y=log2(`NTC_RAD21-batch61_A-rmDup`+0.1))) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  scale_y_continuous(limits = c(0,15)) +
+  scale_x_continuous(limits = c(0,15)) +
+  labs(x="Biological Reads", y="Duplicates Removed") +
+  theme_classic()
+
+oci_FragCount %>%
+  ggplot(aes(x=log2(`NTC_RAD21-batch61_A-biological`+0.1), y=log2(`NTC_RAD21-batch61_A-withDups`+0.1))) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  scale_y_continuous(limits = c(0,20)) +
+  scale_x_continuous(limits = c(0,20)) +
+  labs(x="Biological Reads", y="All Reads") +
+  theme_classic()
+
+oci_FragCount %>%
+  ggplot(aes(x=log2(`NTC_RAD21-batch61_A-OnlyDups`+0.1), y=log2(`NTC_RAD21-batch61_A-AllDupsOnlyDups`+0.1))) +
+  geom_abline(slope = 1, intercept = 0, color = "red", linetype = "dashed", size = 1) +
+  geom_point(alpha = 0.1) +
+  geom_smooth(method = "lm") +
+  scale_y_continuous(limits = c(0,15)) +
+  scale_x_continuous(limits = c(0,15)) +
+  labs(x="Biological Duplicates", y="All Duplicates") +
+  theme_classic()
+```
+
+
+
+
+
+```{r Print Session info}
+sessionInfo()
+```

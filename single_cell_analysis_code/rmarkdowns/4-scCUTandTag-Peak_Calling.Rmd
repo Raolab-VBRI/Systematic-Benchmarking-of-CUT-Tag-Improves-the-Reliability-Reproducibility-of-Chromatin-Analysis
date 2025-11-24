@@ -1,0 +1,848 @@
+---
+title: "4-scCUTandTag-Peak_Calling"
+output: html_document
+date: "2023-07-29"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.keep = 'last')
+```
+
+Begin by loading required libraries and creating enviromental variables.
+```{r Create Enviromental Variables}
+figure_dir <- file.path("figures")
+
+igg_dir <- file.path("alignment", "bedgraph")
+
+data_dir <- file.path("data")
+macs_dir <- file.path("peakCalling", "MACS2")
+cutoff_dir <- file.path(macs_dir, "cutoff_analysis")
+rmdup_cutoff_dir <- file.path(macs_dir, "cutoff_analysis_rmdup")
+seacr_dir <- file.path("peakCalling", "SEACR")
+bam_dir <- file.path("alignment", "bam")
+consensus_dir <- file.path("peakCalling", "consensus")
+```
+
+
+```{r Load Libraries}
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(GenomicRanges)
+library(ggpubr)
+library(stringr)
+```
+
+##Peak Calling with MACS2
+
+
+```{cat MACS2 Cutoff Analysis, engine.opts = list(file = 'scripts/10-MACS2_cutoff.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=MACS2_cutoff # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-03:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=25 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load macs2
+module load parallel
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bamPath="${projPath}/alignment/bam/bulk_bam"
+peakPath="${projPath}/peakCalling/MACS2/cutoff_analysis_rmdup"
+
+# Create output directory
+mkdir -p "${peakPath}"
+
+# Define a function to process each sample
+process_sample() {
+    local i=$1
+    
+    # Specify marks for which you want to call broad peaks
+    local broad="H3K27me3"
+    
+    # Extract genotype and replicate information from filename
+    local geno=$(echo $i | awk '{split($0,a,"_"); print a[1]}')
+    local repli=$(echo $i | awk '{split($0,a,"_"); print a[3]}')
+    
+    # Special case: NTC_CTCF_200nMEGS-A should use IgG replicate B
+    if [[ $i =~ "R1-biological" ]]; then
+        repli="R1-rmDup"
+        echo "Special case: $i will use replicate R1-rmDup"
+    elif [[ $i =~ "_A-biological" ]]; then
+        repli="A-rmDup"
+        echo "Special case: $i will use replicate A-rmDup"
+    fi
+    
+    # Determine if broad peaks should be called
+    if [[ $i =~ $broad ]]; then
+        local peak_type="--broad --broad-cutoff 0.01"
+    else
+        local peak_type=""
+    fi
+    
+    echo "Calling $peak_type peaks for: $i (Genotype: $geno, Replicate: $repli)"
+    echo "Using IgG control: ${geno}_IgG_${repli}"
+    
+    # Run MACS2 peak calling
+    # Parameters:
+    # -t is the target file (this is the only required parameter for MACS2)
+    # -c is the control file. 
+    # -g is the mappable genome size (hs = homo sapiens)
+    # -f is the file type (macs2can also take paired end bed files as input.
+    # --keep-dup auto uses a binomial distribution to calculate the maximum allowed duplicate reads
+    macs2 callpeak \
+      -t "$i".hg38.bowtie2.bam \
+      -c "${geno}_IgG_${repli}".hg38.bowtie2.bam \
+      -f BAMPE $peak_type \
+      -g hs -B --nomodel \
+      --extsize 200 --shift 0 \
+      --cutoff-analysis \
+      -q 0.01 --nolambda \
+      --scale-to large \
+      --keep-dup auto \
+      -n ${peakPath}/"$i".macs2.nolambda.q0.01 \
+      2>${peakPath}/"$i".macs2.summary.txt
+      
+}
+
+# Export all necessary variables
+export -f process_sample
+export projPath bamPath peakPath
+
+# Go to bam directory
+cd $bamPath
+
+# Call peaks using parallel processing (using 5 jobs at once = 25 total cores with 5 cores each)
+ls *.hg38.bowtie2.bam | cut -d . -f 1 | grep -v 'IgG' | parallel -j 5 process_sample {}
+
+echo "All MACS2 peak calling jobs completed at $(date)"
+
+```
+
+```{bash Submit MACS2 DiffBind Script to SLURM, engine.opts='-l'}
+sbatch scripts/10-MACS2_cutoff.sh
+```
+
+
+```{r Get cutoff analysis results}
+read_cutoff_analysis <- function(file_path) {
+    # Read the file, skipping any header lines that start with '#'
+    df <- read.table(file_path, header = TRUE)
+    
+    samp <- gsub(".macs2.nolambda.q0.01_cutoff_analysis.txt", "", basename(file_path)) %>%
+              str_split_1(pattern = "_", string = .)
+
+    # Add sample name
+    df <- df %>%
+          mutate(Sample = samp[1],
+                 Target = samp[2],
+                 Replicate = samp[3])
+    
+    return(df)
+}
+
+cutoff_files <- list.files(cutoff_dir, pattern = "cutoff_analysis.txt$", full.names = TRUE)
+rmdup_cutoff_files <- list.files(rmdup_cutoff_dir, pattern = "cutoff_analysis.txt$", full.names = TRUE)
+
+# Read all files
+cutoff_data <- do.call(rbind, lapply(cutoff_files, read_cutoff_analysis)) 
+rmdup_cutoff_data <- do.call(rbind, lapply(rmdup_cutoff_files, read_cutoff_analysis))
+
+
+# Create elbow plots
+# 1. Number of peaks vs q-score
+sc_elbow <- cutoff_data %>%
+  dplyr::filter(grepl("batch", Target)) %>%
+  ggplot(aes(x = qscore, y = npeaks/1e3, colour = Replicate, group = Replicate)) +
+      geom_line() +
+      geom_point(size = 1) +
+      scale_colour_manual(values = c("#2F3F6A", "#4e69b1", "#A7B4D8", "#970C0F", "#ed2024", "#F69294")) +
+      #geom_vline(xintercept = -log10(0.001), color = "red", linetype = "dashed") +
+      #geom_vline(xintercept = -log10(0.0001), color = "blue", linetype = "dashed") +
+      #geom_vline(xintercept = -log10(0.00001), color = "black", linetype = "dashed") +
+      #annotate("text", x = Inf, y = Inf, label = "1e-3", color = "red", hjust = 1.1, vjust = 4.5, size = 2) +
+      #annotate("text", x = Inf, y = Inf, label = "1e-4", color = "blue", hjust = 1.1, vjust = 3, size = 2) +
+      #annotate("text", x = Inf, y = Inf, label = "1e-5", color = "black", hjust = 1.1, vjust = 1.5, size = 2) +
+      theme_bw() +
+      labs(x = "-log10(q-value)", 
+           y = "Number of Peaks (x10^3)",
+           title = "Elbow Plot: Number of Peaks vs q-score") +
+      scale_linetype_manual(name = "Threshold", values = "dashed") +
+      scale_y_continuous(transform = "log10")
+
+sc_rmdup_elbow <- rmdup_cutoff_data %>%
+  dplyr::filter(grepl("batch", Target)) %>%
+  ggplot(aes(x = qscore, y = npeaks/1e3, colour = Replicate, group = Replicate)) +
+      geom_line() +
+      geom_point(size = 1) +
+      scale_colour_manual(values = c("#2F3F6A", "#4e69b1", "#A7B4D8", "#970C0F", "#ed2024", "#F69294")) +
+      #geom_vline(xintercept = -log10(0.001), color = "red", linetype = "dashed") +
+      #geom_vline(xintercept = -log10(0.0001), color = "blue", linetype = "dashed") +
+      #geom_vline(xintercept = -log10(0.00001), color = "black", linetype = "dashed") +
+      #annotate("text", x = Inf, y = Inf, label = "1e-3", color = "red", hjust = 1.1, vjust = 4.5, size = 2) +
+      #annotate("text", x = Inf, y = Inf, label = "1e-4", color = "blue", hjust = 1.1, vjust = 3, size = 2) +
+      #annotate("text", x = Inf, y = Inf, label = "1e-5", color = "black", hjust = 1.1, vjust = 1.5, size = 2) +
+      theme_bw() +
+      labs(x = "-log10(q-value)", 
+           y = "Number of Peaks (x10^3)",
+           title = "Elbow Plot: Number of Peaks vs q-score") +
+      scale_linetype_manual(name = "Threshold", values = "dashed") +
+      scale_y_continuous(transform = "log10")
+
+
+bulk_rad21_elbow <- cutoff_data %>%
+  dplyr::filter(Target == "RAD21") %>%
+  dplyr::mutate(Duplicates = if_else(grepl("rmDup", Replicate), "No Duplicates", "With Duplicates")) %>%
+  dplyr::mutate(Replicates = sapply(str_split(Replicate, "-"), function(x) x[1])) %>%
+  # Create qscore bins with 0.2 width
+  dplyr::mutate(qscore_bin = floor(qscore / 0.3) * 0.3) %>%
+  # Group by bin and Duplicates to calculate mean and error bars
+  dplyr::group_by(qscore_bin, Duplicates) %>%
+  dplyr::summarise(
+    mean_npeaks = mean(npeaks, na.rm = TRUE),
+    sd_npeaks = sd(npeaks, na.rm = TRUE),
+    se_npeaks = sd_npeaks / sqrt(n()),
+    n_replicates = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = qscore_bin, y = mean_npeaks, colour = Duplicates)) +
+      geom_line() +
+      geom_point(size=2) +
+      geom_errorbar(aes(ymin = mean_npeaks - se_npeaks, ymax = mean_npeaks + se_npeaks), 
+                    width = 0.05) +
+      scale_colour_manual(values = c("No Duplicates" = "#4e69b1", "With Duplicates" = "black")) +
+      theme_bw() +
+      labs(x = "-log10 q-value", 
+           y = "Number of Peaks (mean ± SE)",
+           title = "Elbow Plot: MACS2 Peaks vs q-score") +
+      scale_linetype_manual(name = "Threshold", values = "dashed") +
+      coord_cartesian(ylim = c(0,2.5e5))
+
+bulk_h3k27me3_elbow <- cutoff_data %>%
+  dplyr::filter(Target == "H3K27me3") %>%
+  dplyr::filter(!grepl("R1", Replicate)) %>%
+  dplyr::mutate(Duplicates = if_else(grepl("rmDup", Replicate), "No Duplicates", "With Duplicates")) %>%
+  dplyr::mutate(Replicates = sapply(str_split(Replicate, "-"), function(x) x[1])) %>%
+  # Create qscore bins with 0.2 width
+  dplyr::mutate(qscore_bin = floor(qscore / 0.3) * 0.3) %>%
+  # Group by bin and Duplicates to calculate mean and error bars
+  dplyr::group_by(qscore_bin, Duplicates) %>%
+  dplyr::summarise(
+    mean_npeaks = mean(npeaks, na.rm = TRUE),
+    sd_npeaks = sd(npeaks, na.rm = TRUE),
+    se_npeaks = sd_npeaks / sqrt(n()),
+    n_replicates = n(),
+    .groups = "drop"
+  ) %>%
+  ggplot(aes(x = qscore_bin, y = mean_npeaks, colour = Duplicates)) +
+      geom_line() +
+      geom_point(size=2) +
+      geom_errorbar(aes(ymin = mean_npeaks - se_npeaks, ymax = mean_npeaks + se_npeaks), 
+                    width = 0.05) +
+      scale_colour_manual(values = c("No Duplicates" = "#ed2024", "With Duplicates" = "black")) +
+      theme_bw() +
+      labs(x = "-log10 q-value", 
+           y = "Number of Peaks (mean ± SE)",
+           title = "Elbow Plot: MACS2 Peaks vs q-score") +
+      scale_linetype_manual(name = "Threshold", values = "dashed") +
+      coord_cartesian(ylim = c(0,2.5e5))
+
+
+sc_elbow
+sc_rmdup_elbow
+bulk_h3k27me3_elbow
+bulk_rad21_elbow
+
+```
+
+
+```{r}
+ggsave(filename = "scCnT_MACS2_elbowPlot.pdf", 
+       plot = sc_elbow,
+       width = 7, height = 4,
+       path = figure_dir)
+
+ggsave(filename = "scCnT_MACS2_RAD21-BulkElbowPlot.pdf", 
+       plot = bulk_h3k27me3_elbow,
+       width = 7, height = 4,
+       path = figure_dir)
+
+ggsave(filename = "scCnT_MACS2_H3K27me3-BulkElbowPlot.pdf", 
+       plot = bulk_rad21_elbow,
+       width = 7, height = 4,
+       path = figure_dir)
+```
+
+
+Let's create a script for MACS2 peak calling.
+```{cat MACS2 peak calling, engine.opts = list(file = 'scripts/11-MACS2_callPeaks.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=MACS2_peaks # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-06:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=25 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bamPath="${projPath}/alignment/bam/bulk_bam"
+peakPath="${projPath}/peakCalling/MACS2/rmdup"
+
+# Load macs2 
+module load macs2
+module load parallel
+
+# Create peak directory
+mkdir -p "${peakPath}"
+
+# Define a function to process each sample
+process_sample() {
+    local i=$1
+    
+    # Specify marks for which you want to call broad peaks
+    local broad="H3K27me3"
+    
+    # Extract genotype and replicate information from filename
+    local geno=$(echo $i | awk '{split($0,a,"_"); print a[1]}')
+    local repli=$(echo $i | awk '{split($0,a,"_"); print a[3]}') 
+    
+    # Special case
+    if [[ $i =~ "R1-biological" ]]; then
+        repli="R1-rmDup"
+        echo "Special case: $i will use replicate R1-rmDup"
+    elif [[ $i =~ "_A-biological" ]]; then
+        repli="A-rmDup"
+        echo "Special case: $i will use replicate A-rmDup"
+    fi
+    
+    # For H3K27me3 we will use a q value of 1e-4
+    if [[ $i =~ $broad ]]; then
+        local peak_type="--broad --broad-cutoff 0.0001"
+    else
+        local peak_type="-q 0.00001"
+    fi
+    
+    echo "Calling $peak_type peaks for: $i (Genotype: $geno, Replicate: $repli)"
+    echo "Using IgG control: ${geno}_IgG_${repli}"
+    
+    # Run MACS2 peak calling
+    # Parameters:
+    # -t is the target file (this is the only required parameter for MACS2)
+    # -c is the control file. 
+    # -g is the mappable genome size (hs = homo sapiens)
+    # -f is the file type (macs2 can also take paired end bed files as input.
+    # --keep-dup auto uses a binomial distribution to calculate the maximum allowed duplicate reads
+    macs2 callpeak \
+      -t "$i".hg38.bowtie2.bam \
+      -c "${geno}_IgG_${repli}".hg38.bowtie2.bam \
+      -f BAMPE $peak_type \
+      -g hs -B --nomodel \
+      --extsize 200 --shift 0 \
+      --cutoff-analysis \
+      --nolambda \
+      --scale-to large \
+      --keep-dup auto \
+      -n ${peakPath}/"$i".macs2.nolambda \
+      2>${peakPath}/"$i".macs2.summary.txt
+      
+}
+
+
+# Export all necessary variables
+export -f process_sample
+export projPath bamPath peakPath
+
+# Go to bam directory
+cd $bamPath
+
+# Call peaks using parallel processing (using 5 jobs at once = 25 total cores with 5 cores each)
+ls *.hg38.bowtie2.bam | cut -d . -f 1 | grep -v 'IgG' | parallel -j 5 process_sample {}
+
+echo "All macs2 peak calling jobs completed at $(date)"
+```
+
+
+```{bash Submit MACS2 Script to SLURM, engine.opts='-l'}
+sbatch scripts/11-MACS2_callPeaks.sh
+```
+
+
+## SEACR Peak Calling
+
+
+```{cat SEACR peak calling, engine.opts = list(file = 'scripts/12-SEACR_callPeaks.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=SEACR_peaks # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-05:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=30 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send notifications to
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+## Peak calling with SEACR (Sparse Enrichment Analysis for CUT&RUN)
+
+# Load modules
+module load seacr/1.3
+module load bedtools2
+module load parallel
+
+# Set directories
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+bedgraphPath="${projPath}/alignment/bedgraph"
+peakPath="${projPath}/peakCalling/SEACR/stringent"
+
+# Create output directory
+mkdir -p "${peakPath}"
+
+
+# Define a function to process each sample
+process_sample() {
+    local i=$1
+    
+    # Extract genotype and replicate information from filename
+    local geno=$(echo $i | awk '{split($0,a,"_"); print a[1]}')
+    local repli=$(echo $i | awk '{split($0,a,"_"); print a[3]}')
+    
+    # Special case
+    if [[ $i =~ "R1-biological" ]]; then
+        repli="R1-rmDup"
+        echo "Special case: $i will use replicate R1-rmDup"
+    elif [[ $i =~ "_A-biological" ]]; then
+        repli="A-rmDup"
+        echo "Special case: $i will use replicate A-rmDup"
+    fi
+    
+    echo "Calling $peak_type peaks for: $i (Genotype: $geno, Replicate: $repli)"
+    echo "Using IgG control: ${geno}_IgG_${repli}"
+    
+    # Run SEACR peak calling
+    # 1st argument is the experimental file
+    # 2nd argument is the input / background file
+    # 3rd argument specifies that my data has not been normalized. SEACR will attempt to normalize the data for me
+    # 4th specifying 'relaxed' means we are willing to have some false positive peaks
+    # 5th we are specifying the output file
+    SEACR_1.3.sh $bedgraphPath/"$i".bowtie2.fragments.bedgraph \
+    $bedgraphPath/"${geno}_IgG_${repli}".bowtie2.fragments.bedgraph \
+    norm stringent \
+    $peakPath/"$i".seacr.control.peaks
+
+}
+
+
+# Export function and variables for parallel
+export -f process_sample
+export projPath bedgraphPath peakPath
+
+# Go to bedgraph directory
+cd $bedgraphPath
+
+# Call peaks using parallel processing (using 5 jobs at once = 25 total cores with 5 cores each)
+ls *.bowtie2.fragments.bedgraph | cut -d . -f 1 | grep -v 'IgG' | parallel -j 5 process_sample {}
+
+echo "All SEACR peak calling jobs completed at $(date)"
+
+```
+
+```{bash Submit SEACR Script to SLURM, engine.opts='-l'}
+sbatch scripts/12-SEACR_callPeaks.sh
+```
+
+##Examine Peak Reproducibility
+
+```{bash}
+cd alignment/bam
+
+ls *bulk* | cut -d . -f 1 | sort | uniq > bulk_sampleList.txt
+```
+
+Read the sample list text files into R
+```{r Read Sample Lists into R}
+bulk_sampleList <- scan(file = "bulk_sampleList.txt", what = "character")
+```
+Lets create a script that is easier to re-purpose for collecting data from different peak calling programs.
+
+```{r Create Function for Gathering Information about Peak N and Width}
+
+GetPeakN <- function(samples, #list of samples. should include genotype, epigenetic target, & replicate (these need to be separated by a delimiter)
+                     sampleDelimiter, #what character did you use to separate important features in your file names? I usually use "_" to seperate genotype_target_replicate in file names
+                     peakPath, #What directory are these peaks in?
+                     peakExt, #What is the extension of your peak files? (ex: '_bowtie2.mapped.sorted.rmDup.bam')
+                     peakName #What do you want to call the dataframe that will be output?
+                     ){
+
+  #These variables need to start out as = c()
+  peakN = c()
+  peakWidth = c()
+
+  for(hist in samples){
+  
+    histInfo = strsplit(hist, sampleDelimiter)[[1]] #This should break down you targets into genotype, sample, and replicate
+    
+    filePath <- file.path(peakPath, paste0(hist, peakExt))
+  
+      if(file.size(filePath) != 0 & file.exists(filePath)){
+          peakInfo = read.table(filePath, header = FALSE, fill = TRUE)  %>% 
+          mutate(width = abs(V3-V2))
+      
+          peakN = data.frame(peakN = nrow(peakInfo),
+                         Histone = paste0(histInfo[1], "_", histInfo[2]), 
+                         Replicate = histInfo[3]) %>% 
+          rbind(peakN, .)
+      
+          peakWidth = data.frame(width = peakInfo$width,
+                             Histone = paste0(histInfo[1], "_", histInfo[2]), 
+                             Replicate = histInfo[3])  %>% 
+          rbind(peakWidth, .)
+      }
+    
+  }
+  
+  return(list(assign(paste0(peakName, "_peakN"), peakN), #The assign function allows us to create a new variable with the name 'peakName' and the value of 'peakN'
+              assign(paste0(peakName, "_peakW"), peakWidth))) #We want to return more than one dataframe. In order to do this we need to return a list of dataframes that has a length of 2.
+}
+
+```
+
+
+
+```{r Collect MACS2 Peak Info}
+peakNumData <- GetPeakN(samples = bulk_sampleList,
+         sampleDelimiter = "_",
+         peakPath = macs_dir,
+         peakExt = ".macs2.peak.q0.05.control.rmDup-broad_peaks.broadPeak",
+         peakName = "macs2Peaks")
+```
+
+
+```{r Read in bulk alignment results}
+bulk_alignDupSummary <- readRDS(file = "/scratch/g/srrao/josiah_ociaml3/josiah_ociaml3_cutandtag/alignSummary.rds") %>%
+  filter(Histone == "NTC_Rad21" | Histone == "SMC3het_Rad21")
+
+seacr_bulk_peakinfo <- left_join(seacr_bulk_peakinfo, bulk_alignDupSummary, by = c("Histone", "Replicate"))
+```
+
+
+## Graph MACS2 peak info
+```{r Graph the Number of MACS2 Peaks}
+macs_fig1a <- peakNumData[[1]] %>%
+  filter(Replicate != "pseudobulk") %>%
+  ggplot(aes(x = Histone, y = peakN)) +
+  geom_boxplot(outlier.shape = NA) + 
+  #scale_y_continuous(trans = "log10") +
+  ylab("Number of Peaks") +
+  ggtitle("MACS2 Peaks") +
+  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
+  theme(legend.title = element_blank(), axis.title.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+macs_fig1a
+```
+
+```{r Save MACS2 Peak Figure}
+ggsave(filename = "OCIAML3_NTC_SMC3het_scRad21_MACS2peaks.pdf", 
+       plot = macs_fig1a, 
+       device = "pdf",
+       width = 8, 
+       height = 5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+```{r Determine MACS2 Peak Reproducibility}
+histL <- c()
+for(hist in bulk_sampleList){
+  histInfo <- strsplit(hist, "_")[[1]]
+  if(is.null(histL[1])){
+    histL[1] <- paste0(histInfo[1], "_", histInfo[2])
+  }
+  else{  
+  histL <- append(histL, paste0(histInfo[1], "_", histInfo[2]), after = length(histL))
+  }
+}
+
+bulkhistL <- histL %>% unique()
+
+bulkrepL = c("bulkE", "bulkF", "bulkG", "bulkH", "Apseudobulk", "Bpseudobulk")
+
+macsPeakOver = c()
+peakReprod = c()
+
+  for(hist in bulkhistL){
+    raw.grl = GRangesList()
+    overlap.grl = GRangesList()
+    
+    for(rep in bulkrepL){
+      print(paste0(macs_dir, "/", hist, "_", rep, ".macs2.peak.q0.05.control.rmDup_peaks.narrowPeak"))
+      
+      if(file.exists(paste0(macs_dir, "/", hist, "_", rep, ".macs2.peak.q0.05.control.rmDup_peaks.narrowPeak"))){
+        
+        peakInfo = read.table(paste0(macs_dir, "/", hist, "_", rep, ".macs2.peak.q0.05.control.rmDup_peaks.narrowPeak"), header = FALSE, fill = TRUE)
+        #We can read in the bed files from SEACR as a granges object
+        peakInfo.gr = GRanges(peakInfo$V1, IRanges(start = peakInfo$V2, end = peakInfo$V3), strand = "*")
+        #Add the GRanges object to a GRangesList so that we can use it later
+        raw.grl[[rep]] <- peakInfo.gr
+        
+      }
+      
+    }
+    
+    for(rep in raw.grl@partitioning@NAMES){
+      #For all samples I have 6 replicates (4 bulk & 2 pseudobulk)
+      if (length(raw.grl) == 6){
+        peakReprod <- data.frame(Histone = hist,
+                  Replicate = rep,
+                  ReprodNumE = length(findOverlaps(raw.grl[[rep]], raw.grl[[1]])),
+                  ReprodNumF = length(findOverlaps(raw.grl[[rep]], raw.grl[[2]])),
+                  ReprodNumG = length(findOverlaps(raw.grl[[rep]], raw.grl[[3]])),
+                  ReprodNumH = length(findOverlaps(raw.grl[[rep]], raw.grl[[4]])),
+                  ReprodNumApseudo = length(findOverlaps(raw.grl[[rep]], raw.grl[[5]])),
+                  ReprodNumBpseudo = length(findOverlaps(raw.grl[[rep]], raw.grl[[6]]))) %>%
+        rbind(peakReprod, .)
+      
+      }else{
+      #All other samples have 2 replicates
+         peakReprod <- data.frame(Histone = hist,
+                  peakType = type,
+                  Replicate = rep,
+                  ReprodNumA = NA,
+                  ReprodNumB = NA,
+                  ReprodNumC = length(findOverlaps(raw.grl[[1]], raw.grl[[rep]])),
+                  ReprodNumD = length(findOverlaps(raw.grl[[2]], raw.grl[[rep]]))) %>%
+        rbind(peakReprod, .)
+      }
+
+    }
+    
+  }
+
+
+macsPeakOver <- left_join(peakNumData[[1]], peakReprod, by = c("Histone", "Replicate"))
+
+macsPeakOver <- macsPeakOver %>% mutate(peakReprodRateE = ReprodNumE / peakN * 100,
+                    peakReprodRateF = ReprodNumF / peakN * 100,
+                    peakReprodRateG = ReprodNumG / peakN * 100,
+                    peakReprodRateH = ReprodNumH / peakN * 100,
+                    peakReprodRateApseudo = ReprodNumApseudo / peakN * 100,
+                    peakReprodRateBpseudo = ReprodNumBpseudo / peakN * 100)
+
+#The reproducible rates of 100% are just an artifact of comparing overlaps between the same replicate... we can change these to NA prior to plotting 
+macsPeakOver[macsPeakOver == 100] <- NA
+
+macsPeakOver
+```
+
+
+```{r Graph MACS2 peak reproducibility}
+macs_fig2 <- macsPeakOver %>%
+  select(Histone, peakReprodRateE, peakReprodRateF, peakReprodRateG, peakReprodRateH, peakReprodRateApseudo, peakReprodRateBpseudo) %>%
+  tidyr::pivot_longer(cols = c("peakReprodRateE", "peakReprodRateF", "peakReprodRateG", "peakReprodRateH", "peakReprodRateApseudo", "peakReprodRateBpseudo"), names_to = "from", values_to = "rate") %>%
+  ggplot(aes(x = Histone, y = rate, fill = Histone)) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(position = position_jitter(0.15)) +
+  ylab("% of Peaks Reproduced") +
+  theme(legend.title = element_blank(), axis.title.x = element_blank(), axis.text.x = element_blank()) + 
+  theme(axis.text.x = element_blank()) + 
+  ggtitle("OCI-AML3 CUT&Tag MACS2 Peaks") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+macs_fig2
+```
+
+```{r}
+ggsave(filename = "OCIAML3_Rad21_PeakReproducibility_NTC_SMC3het.pdf", 
+       plot = macs_fig2, 
+       device = "pdf",
+       width = 8, 
+       height = 5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+```{r Graph the Percentage of PseudoBulk Peaks that were also found in Bulk Samples}
+pseudopeakfig1 <- macsPeakOver %>%
+  filter(grepl("pseudo", macsPeakOver$Replicate)) %>%
+  select(Histone, Replicate, peakReprodRateE, peakReprodRateF, peakReprodRateG, peakReprodRateH) %>%
+  tidyr::pivot_longer(cols = c("peakReprodRateE", "peakReprodRateF", "peakReprodRateG", "peakReprodRateH"), names_to = "from", values_to = "rate") %>%
+  ggplot(aes(x=Histone, y=rate)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = Replicate)) +
+  ylab("Percentage of SC Peaks Identified in Bulk") +
+  ggtitle("OCIAML3 - Reproducibility of Rad21 scCUT&Tag Peaks")
+
+pseudopeakfig1
+```
+
+```{r Graph the Percentage of Bulk Peaks that were found by PseudoBulk Samples}
+pseudopeakfig2 <- macsPeakOver %>%
+  filter(!grepl("pseudo", macsPeakOver$Replicate)) %>%
+  select(Histone, Replicate, peakReprodRateApseudo, peakReprodRateBpseudo) %>%
+  tidyr::pivot_longer(cols = c("peakReprodRateApseudo", "peakReprodRateBpseudo"), names_to = "from", values_to = "rate") %>%
+  ggplot(aes(x=Histone, y=rate)) +
+  geom_boxplot() +
+  geom_jitter(aes(color = Replicate)) +
+  ylab("Percentage of Bulk Peaks Identified via SC") +
+  ggtitle("OCIAML3 - Reproducibility of Rad21 scCUT&Tag Peaks")
+
+pseudopeakfig2
+  
+```
+
+
+```{r Save Peak Reproducibility Figures}
+
+ggsave(filename = "OCIAML3_BulkPeaksIdentifiedViaScCUTnTag_NTC_SMC3het.pdf", 
+       plot = pseudopeakfig2, 
+       device = "pdf",
+       width = 8, 
+       height = 5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+ggsave(filename = "OCIAML3_scCUTnTagPeaksIdentifiedViaBulk_NTC_SMC3het.pdf", 
+       plot = pseudopeakfig1, 
+       device = "pdf",
+       width = 8, 
+       height = 5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+
+
+```
+
+
+```{r Determine MACS2 Peak Widths}
+macs_fig3 <- peakNumData[[2]] %>%
+  ggplot(aes(x = Replicate, y = width, fill = Histone)) +
+  geom_violin() + 
+  scale_y_continuous(trans = "log10") +
+  xlab(NULL) +
+  ylab("Peak Width") +
+  theme() + 
+  ggtitle("OCI-AML3 Rad21 MACS2-Narrow Peak Width") +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+macs_fig3
+```
+
+```{r}
+ggsave(filename = "OCIAML3_scCUTnTagPeakWidth_NTC_SMC3het.pdf", 
+       plot = macs_fig3, 
+       device = "pdf",
+       width = 8, 
+       height = 5,
+       units = "in",
+       dpi = "print",
+       bg = "white",
+       path = "figures")
+```
+
+
+
+```{r Determine MACS2 FRiP scores}
+library(chromVAR)
+
+sampleList <- scan(file = "SampleList.txt", what = "character")
+
+macsInPeakData = c()
+
+for(hist in bulk_sampleList){
+  histInfo = strsplit(hist, "_")[[1]]
+  
+   if(file.exists(paste0(macs_dir, "/", hist, ".macs2.peak.q0.05.control.rmDup_peaks.narrowPeak"))){
+      
+      peakRes = peakInfo = read.table(paste0(macs_dir, "/", hist, ".macs2.peak.q0.05.control.rmDup_peaks.narrowPeak"), 
+                            header = FALSE, fill = TRUE) 
+      peak.gr = GRanges(seqnames = peakRes$V1, IRanges(start = peakRes$V2, end = peakRes$V3), strand = "*")
+      
+      bamFile = paste0(bam_dir, "/", hist, ".bowtie2.rmDup.bam")
+      
+      
+      fragment_counts <- getCounts(bamFile, peak.gr, paired = TRUE, by_rg = FALSE, format = "bam")
+      inPeakN = counts(fragment_counts)[,1] %>% sum
+      macsInPeakData = rbind(macsInPeakData, 
+                         data.frame(inPeakN = inPeakN, 
+                                    Histone = paste0(histInfo[1], "_", histInfo[2]), 
+                                    Replicate = paste0(histInfo[3])))
+    
+  }
+}
+
+macs_bulk_peakinfo <- left_join(macsPeakOver, macsInPeakData, by = c("Histone", "Replicate"))
+```
+
+
+```{r Graph MACS2 FRiP scores}
+macs_fig4 <- macs_bulk_peakinfo %>%
+  dplyr::filter(peakType == "narrow") %>%
+  ggplot(aes(x = Histone, y = (inPeakN / MappedFragNum.y * 100), fill = Histone)) +
+  geom_boxplot() +
+  geom_jitter(position = position_jitter(0.15)) +
+  ylab("% of Fragments in Peaks") +
+  ggtitle("Narrow Peaks") +
+  theme(legend.box.margin = margin(0, 20, 0, 20), axis.text.x = element_blank(), axis.title.x = element_blank()) +
+  guides(fill = guide_legend(nrow = 3, byrow = TRUE))
+
+
+macs_fig4
+```
+
+
+```{r make a data table that also incorporates cell number}
+allpeakdata <- peakN %>%
+  filter(peakType == "control") %>%
+  right_join(frip, by = c("Histone", "Replicate")) %>%
+  select(Histone, Replicate, peakN, peakType, MappedFragNum, inPeakN, frip, AlignmentRate,)
+
+
+mutate(allpeakdata, cellnum = c(19, 50000, 442, 50000, 478, 50000)) %>%
+  DT::datatable()
+
+```
+
+
+

@@ -1,0 +1,326 @@
+---
+title: "1-CUTandTag-Import-Data-and-Align"
+output: html_document
+date: "2024-02-06"
+author: Josiah Murray
+---
+
+
+## Settings
+```{r Chunk Settings, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.keep = 'last')
+```
+
+## Download fastq Files from Basespace
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+We need to create variables for R and Linux that hold the directory locations.
+```{r Create Enviromental Variables}
+proj_name <- "lsk_scCUTnTag" #Enter a name for your project's directory
+
+scratch_dir <- file.path("scratch", "g", "srrao", "josiah_ociaml3", proj_name) #This builds a path for my RCC scratch directory
+
+fastq_dir <- file.path(scratch_dir, "fastq")
+ 
+jobreport_dir <- file.path("job_reports")
+
+scripts_dir <- file.path("scripts")
+
+#Make a directory for job outputs
+if (!(dir.exists(jobreport_dir))){
+  dir.create(jobreport_dir)
+}
+
+if (!(dir.exists(scripts_dir))){
+  dir.create(scripts_dir)
+}
+
+```
+
+
+
+
+
+
+##Create Reference Genome Indexes (for mm10)
+
+```{r Create Directory for Aligned bam Files}
+align_dir <- file.path("alignment")
+sam_dir <- file.path(align_dir, "sam")
+bowtie_sam_dir <- file.path(sam_dir, "bowtie2_summary")
+index_dir <- file.path("ref_genomes") #Make sure to use the appropriate species index!!!
+scripts_dir <- file.path("scripts")
+
+# Create directories if they doesn't exist
+if (!(dir.exists(align_dir))) {
+  dir.create(align_dir)
+}
+
+if (!(dir.exists(sam_dir))) {
+  dir.create(sam_dir)
+}
+
+if (!(dir.exists(index_dir))) {
+  dir.create(index_dir)
+}
+
+if (!(dir.exists(scripts_dir))) {
+  dir.create(scripts_dir)
+}
+
+if (!(dir.exists(bowtie_sam_dir))) {
+  dir.create(bowtie_sam_dir)
+}
+
+# Create environmental variables that represent directory paths
+Sys.setenv(ALIGN_DIR = paste0("/", scratch_dir, "/", align_dir)) #CLI will need the full filepath
+Sys.setenv(SAM_DIR = paste0("/", scratch_dir, "/", sam_dir))
+Sys.setenv(INDEX_DIR = paste0("/", scratch_dir, "/", index_dir))
+Sys.setenv(SCRIPTS_DIR = paste0("/", scratch_dir, "/", scripts_dir))
+```
+
+Download FASTA files for creating a bowtie index.
+For OCIAML3 and Henikoff K562 we will use GRCH38
+```{bash Download FASTA reference files}
+cd ref_genomes/
+
+#Get hg38 v111 from ensembl
+wget https://ftp.ensembl.org/pub/release-111/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
+
+
+```
+
+
+
+Now we can use bowtie2 to create indexes. Be sure to request sufficient RAM since building indexes is memory intensive.
+```{cat Build Bowtie Index, engine.opts = list(file = 'scripts/1-index_build.sh')}
+#!/bin/bash
+
+#SBATCH -p bigmem # partition name
+#SBATCH --job-name=build_indexes # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-02:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=15 # number of threads
+#SBATCH --mem-per-cpu=31Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load packages
+module load bowtie/2.5.0
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+refPath="${projPath}/ref_genomes"
+hg38OutPath="${refPath}/GRCH38_bowtie2"
+
+
+mkdir -p "$hg38OutPath"
+
+
+
+# Build human genome index
+cd "$refPath"
+
+
+echo "Building human genome index"
+#bowtie2-build --threads 15 -f Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz "$hg38OutPath/Homo_sapiens.GRCh38.v111.dna.primary_assembly"
+
+echo "Index building completed at $(date)"
+
+```
+
+```{bash Run bowtie2-build, engine.opts='-l'}
+sbatch scripts/1-index_build.sh
+```
+
+
+##Trim Adapters
+
+Lets remove any adapter sequences. This can be done using cutadapt. 
+```{cat Create Trim Galore Script, engine.opts = list(file = 'scripts/2-trim.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=trim # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 0-16:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=30 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH --output=%x.out # File to which standard output will be written
+#SBATCH -o job_reports/%x.out # File to which standard outpout will be written
+#SBATCH -e job_reports/%x.err # File to whcih standard error wil be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email adress to send to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# set directories
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+fastqPath="${projPath}/Okur_fastq"
+outPath="${projPath}/Okur_fastq_trim"
+
+mkdir -p "$outPath"
+
+
+# Load package
+module load parallel
+module load cutadapt
+
+# Create output directory
+mkdir -p $outPath
+
+trim_sample() {
+  local i=$1
+  
+  # Trim adapter sequences with cutadapt
+  cutadapt -j 5 -m 20 -a CTGTCTCTTATACACATCT -A CTGTCTCTTATACACATCT \
+  -o "$outPath"/"$i"_cut.1.fq.gz -p "$outPath"/"$i"_cut.2.fq.gz \
+  "$i"_1.fastq.gz "$i"_2.fastq.gz
+
+}
+
+export -f trim_sample
+export fastqPath outPath
+
+cd $fastqPath
+
+ls *_1.fastq.gz | cut -d _ -f 1,2,3 | sort | uniq | parallel -j 6 trim_sample {}
+```
+
+```{bash Run trim script, engine.opts='-l'}
+sbatch scripts/2-trim.sh
+```
+
+##Align
+
+Now we can create a script file for aligning the fastq reads. We will need to submit this script to the SLURM in another chunk.
+```{cat Create Bowtie Script, engine.opts = list(file = 'scripts/3-alignment.sh')}
+#!/bin/bash
+
+#SBATCH -p normal # partition name
+#SBATCH --job-name=bowtie2 # Job name
+#SBATCH --ntasks=1 # number of tasks
+#SBATCH --time 2-00:00 # time limit (day-hour:min)
+#SBATCH --cpus-per-task=16 # number of threads
+#SBATCH --mem-per-cpu=7Gb # requested memory
+#SBATCH --account=srrao # PI's net ID
+#SBATCH -o job_reports/%x.out # File to which standard output will be written
+#SBATCH -e job_reports/%x.err # File to which standard error will be written
+#SBATCH --mail-type=ALL # What email updates to send
+#SBATCH --mail-user=jmurray@mcw.edu # Email address to send notifications to
+
+echo Starting at $(date)
+echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
+echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
+
+# Load modules
+module load bowtie/2.5.0
+module load samtools
+module load parallel
+
+# Set directory paths
+projPath="/scratch/g/srrao/josiah_ociaml3/Duplicate_Calculations_CUTnTag"
+okurFqPath="${projPath}/Okur_fastq_trim"
+ociFqPath="${projPath}/OCI_fastq_trim"
+
+# Set path to bowtie2 index (should point to the index prefix, not directory)
+ref="${projPath}/ref_genomes/GRCH38_bowtie2/Homo_sapiens.GRCh38.v111.dna.primary_assembly"
+
+bamPath="${projPath}/alignment/bam"
+sumPath="${bamPath}/bowtie2_summary"
+
+okurBamPath="${bamPath}/okur_bam"
+ociBamPath="${bamPath}/oci_bam"
+
+# Create output directories
+mkdir -p "${sumPath}"
+mkdir -p "${okurBamPath}"
+mkdir -p "${ociBamPath}"
+
+# Check if reference index exists
+if [ ! -f "${ref}.1.bt2" ]; then
+    echo "Error: Bowtie2 index not found at ${ref}"
+    exit 1
+fi
+
+# Create a function for the alignment process
+align_sample() {
+  # Store sample ID from first argument
+  local sample_id=$1
+  # reference genome
+  local ref_genome=$2
+  # ending for bam file
+  local suffix=$3
+  # fastq input directory
+  local fastq_dir=$4
+  # bam output directory
+  local bam_dir=$5
+  
+  # Check if input files exist
+  if [ ! -f "${fastq_dir}/${sample_id}.cut.1.fq.gz" ] || [ ! -f "${fastq_dir}/${sample_id}.cut.2.fq.gz" ]; then
+    echo "Error: Input files not found for sample ${sample_id} in ${fastq_dir}"
+    return 1
+  fi
+  
+  # Pipeline: bowtie2 alignment -> sam to bam conversion
+  # --very-sensitive takes longer to run, but search for alignments more thoroughly.
+  # --no-mixed stops bowtie from aligning the mate of an unaligned read pair 
+  # --no-discordant means read pairs must align to same Chr.
+  # --phred33 indicate the phred scores for illumina sequencing. 
+  # -I & -X indicate the distance between paired reads
+  # Using 7 cores for each bowtie2 (running 5 parallel alignment = 35 total cpu)
+  # Pipe the stderr file to the bowtie2_summary directory using "2>"
+  # Pipe the stdout file (sam format) to samtools for conversion to a bam file
+  bowtie2 \
+    --local --very-sensitive-local --soft-clipped-unmapped-tlen \
+    --no-mixed --no-discordant \
+    --dovetail --phred33 -I 10 -X 1000 \
+    -p 7 \
+    -x ${ref_genome} -1 ${fastq_dir}/${sample_id}.cut.1.fq.gz -2 ${fastq_dir}/${sample_id}.cut.2.fq.gz \
+    2> ${sumPath}/${sample_id}.${suffix}.bowtie2.txt \
+  | samtools view -@ 7 -bS -o ${bam_dir}/${sample_id}.${suffix}.bowtie2.bam
+
+}
+
+# Export function and variables for parallel
+export -f align_sample
+export ref sumPath
+
+# Align OCI to hg38
+cd $ociFqPath
+
+echo "Starting OCI alignments..."
+ls *.cut.1.fq.gz | cut -d . -f 1 | sort | uniq \
+| parallel -j 5 align_sample {} ${ref} "hg38" ${ociFqPath} ${ociBamPath}
+
+# Align Okur K562 to hg38
+cd $okurFqPath
+
+echo "Starting Okur K562 alignments..."
+ls *.cut.1.fq.gz | cut -d . -f 1 | sort | uniq \
+| parallel -j 5 align_sample {} ${ref} "hg38" ${okurFqPath} ${okurBamPath}
+
+echo "All alignments completed at $(date)"
+```
+
+Now we can submit the alignment.sh script to the RCC SLURM
+```{bash Run Bowtie Alignment, engine.opts='-l'}
+sbatch scripts/3-alignment.sh
+```
+
+
+
+```{r print session info}
+sessionInfo()
+```

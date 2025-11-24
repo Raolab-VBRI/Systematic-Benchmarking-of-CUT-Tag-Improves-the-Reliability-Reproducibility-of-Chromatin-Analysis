@@ -1,0 +1,593 @@
+---
+title: "8-CUTandTag-ChIPpeakAnno"
+output: html_document
+date: "2023-09-23"
+---
+##Set up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.keep = 'last')
+```
+
+```{r Load Libraries}
+library(ChIPpeakAnno)
+library(tidyverse)
+library(rtracklayer)
+library(GenomicRanges)
+library(circlize)
+```
+
+```{r Make Directories}
+igg_dir <- file.path("alignment", "bedgraph")
+macs_dir <- file.path("peakCalling", "MACS3")
+cutoff_dir <- file.path(macs_dir, "cutoff_analysis")
+rmdup_cutoff_dir <- file.path(macs_dir, "cutoff_analysis_rmdup")
+seacrRelaxed_dir <- file.path("peakCalling", "SEACR")
+seacrStringent_dir <- file.path("peakCalling", "SEACR", "stringent")
+macs_dir <- file.path("peakCalling", "MACS3")
+bam_dir <- file.path("alignment", "bam")
+consensus_dir <- file.path("peakCalling", "consensus")
+encode_H3K27me3_dir <- file.path("ref_genomes", "H3K27me3_ENCFF977FWM.bed")
+figure_dir <- file.path("figures")
+```
+
+## Import Peaks
+We will use a granges list to store all of our peak data.
+```{r read in Encode H3K27me3 peaks}
+h3k27me3_encode_gr <- read_delim(file = encode_H3K27me3_dir,
+                                 delim = "\t",
+                                 col_names = c("Chr", "Start", "End", "peak", "score", "strand")) %>%
+  dplyr::select(1:6) %>%
+  makeGRangesFromDataFrame()
+
+
+seqlevelsStyle(h3k27me3_encode_gr) <- "NCBI"
+
+h3k27me3_encode_gr
+```
+
+
+
+```{r get single cell granges}
+# Create GRangesList for each single cell peak caller
+targetList <- c("H3K27me3", "RAD21")
+
+granges_list <- list()
+
+for(target in targetList){
+  
+  # Initialize list to store peaks for this condition
+  condition_peaks <- list()
+  
+  # Get MACS peaks - use .broadPeak for H3K27me3, .narrowPeak for others
+  peak_extension <- ifelse(target == "H3K27me3", "\\.broadPeak$", "\\.narrowPeak$")
+  for(sample in list.files(path = macs_dir, pattern = paste0(".*", target, ".*", peak_extension))){
+    
+      print(paste("Processing peak file:", sample))
+      
+      # Read the data first
+      peaks_df <- read_delim(file = file.path(macs_dir, sample),
+                             delim = "\t",
+                             col_names = c("Chr", "Start", "End", "peak", "score", "strand"))
+  
+      # Convert to GRanges
+      peaks <- makeGRangesFromDataFrame(peaks_df, keep.extra.columns = TRUE)
+      
+      # Store peaks with sample name as list element name
+      sample_name <- gsub(paste0(peak_extension, "$"), "", sample)  # Remove peak extension
+      condition_peaks[[sample_name]] <- peaks
+  }
+  
+  # Get SEACR Relaxed Peaks
+  for(sample in list.files(path = seacrRelaxed_dir, pattern = paste0(".*", target, ".*", ".relaxed.bed$"))){
+    
+      print(paste("Processing peak file:", sample))
+      
+      # Read the data first
+      peaks_df <- read_delim(file = file.path(seacrRelaxed_dir, sample),
+                             delim = "\t",
+                             col_names = c("Chr", "Start", "End", "TotalSignal", "MaximumBedgraphSignal", "Range"))
+  
+      # Convert to GRanges
+      peaks <- makeGRangesFromDataFrame(peaks_df, keep.extra.columns = TRUE)
+      
+      # Store peaks with sample name as list element name
+      sample_name <- gsub(paste0(peak_extension, "$"), "", sample)  # Remove peak extension
+      condition_peaks[[sample_name]] <- peaks
+  }
+      
+  # Get SEACR Stringent Peaks
+  for(sample in list.files(path = seacrStringent_dir, pattern = paste0(".*", target, ".*", ".stringent.bed$"))){
+    
+      print(paste("Processing peak file:", sample))
+      
+      # Read the data first
+      peaks_df <- read_delim(file = file.path(seacrStringent_dir, sample),
+                             delim = "\t",
+                             col_names = c("Chr", "Start", "End", "TotalSignal", "MaximumBedgraphSignal", "Range"))
+  
+      # Convert to GRanges
+      peaks <- makeGRangesFromDataFrame(peaks_df, keep.extra.columns = TRUE)
+      
+      # Store peaks with sample name as list element name
+      sample_name <- gsub(paste0(peak_extension, "$"), "", sample)  # Remove peak extension
+      condition_peaks[[sample_name]] <- peaks
+  }
+  
+  # Convert to GRangesList and store in main list
+  target_name <- gsub("_", "", target)  # Remove underscore for cleaner names
+  granges_list[[target_name]] <- GRangesList(condition_peaks)
+}
+```
+
+
+
+##Compare Peak Overlaps with Chip Peak Anno
+```{r CTCF Peak Overlaps}
+macs_h3k27me3_sc_ol <- findOverlapsOfPeaks(
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs3.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs3.nolambda_peaks`,
+  h3k27me3_encode_gr,
+  maxgap = 10000,
+  connectedPeaks = "keepAll")
+
+macs_h3k27me3_sc_biological_ol <- findOverlapsOfPeaks(
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
+  h3k27me3_encode_gr,
+  maxgap = 5000,
+  connectedPeaks = "keepAll")
+
+seacr_h3k27me3_sc_ol <- findOverlapsOfPeaks(
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.seacr.control.peaks.relaxed.bed`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.seacr.control.peaks.relaxed.bed`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.seacr.control.peaks.relaxed.bed`,
+  h3k27me3_encode_gr,
+  maxgap = 10000,
+  connectedPeaks = "keepAll")
+
+seacr_h3k27me3_sc_biological_ol <- findOverlapsOfPeaks(
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.seacr.control.peaks.relaxed.bed`,
+  h3k27me3_encode_gr,
+  maxgap = 5000,
+  connectedPeaks = "keepAll")
+
+
+makeVennDiagram(macs_h3k27me3_sc_ol, 
+                #totalTest = 80000,
+                #col = c("black", "#3b3b3b", "darkblue"), #circle color
+                #cat.col = c("black", "#3b3b3b", "darkblue"), #label color
+                #fill = c("darkgrey", "lightgrey", "lightblue"), #circle fill
+                #cat.cex = c(1.5,1.5,1.5),
+                #main = "Lin- Sca1+ cKit+ H3K27me3 Peak Overlaps",
+                NameOfPeaks = c('Biological', 'No Duplicates', "All Reads", "ENCODE"),
+                connectedPeaks = "keepAll")
+
+
+makeVennDiagram(seacr_h3k27me3_sc_ol, 
+                #totalTest = 80000,
+                #col = c("black", "#3b3b3b", "darkblue"), #circle color
+                #cat.col = c("black", "#3b3b3b", "darkblue"), #label color
+                #fill = c("darkgrey", "lightgrey", "lightblue"), #circle fill
+                #cat.cex = c(1.5,1.5,1.5),
+                #main = "Lin- Sca1+ cKit+ H3K27me3 Peak Overlaps",
+                NameOfPeaks = c('Biological', 'No Duplicates', "All Reads", "ENCODE"),
+                connectedPeaks = "keepAll")
+
+
+makeVennDiagram(macs_h3k27me3_sc_biological_ol, 
+                #totalTest = 80000,
+                #col = c("black", "#3b3b3b", "darkblue"), #circle color
+                #cat.col = c("black", "#3b3b3b", "darkblue"), #label color
+                #fill = c("darkgrey", "lightgrey", "lightblue"), #circle fill
+                #cat.cex = c(1.5,1.5,1.5),
+                #main = "Lin- Sca1+ cKit+ H3K27me3 Peak Overlaps",
+                NameOfPeaks = c('Biological', "ENCODE"),
+                connectedPeaks = "keepAll")
+
+makeVennDiagram(seacr_h3k27me3_sc_biological_ol, 
+                #totalTest = 80000,
+                #col = c("black", "#3b3b3b", "darkblue"), #circle color
+                #cat.col = c("black", "#3b3b3b", "darkblue"), #label color
+                #fill = c("darkgrey", "lightgrey", "lightblue"), #circle fill
+                #cat.cex = c(1.5,1.5,1.5),
+                #main = "Lin- Sca1+ cKit+ H3K27me3 Peak Overlaps",
+                NameOfPeaks = c('Biological', "ENCODE"),
+                connectedPeaks = "keepAll")
+
+```
+
+
+```{r}
+svg(filename = paste0(figure_dir, "/lsk_h3k27me3_chippeakanno_venndiagram.svg"),
+    width = 6,
+    height = 5,)
+
+makeVennDiagram(h3k27me3_ol_15k,
+                #totaltest=80000,
+                col = c("black", "#3b3b3b", "darkblue"), #circle color
+                cat.col = c("black", "#3b3b3b", "darkblue"), #label color
+                fill = c("darkgrey", "lightgrey", "lightblue"),
+                #main = "Lin- Sca1+ cKit+ H3K27me3 Peak Overlaps",
+                NameOfPeaks = c('Bulk1', 'Bulk2', "Pseudobulk"))
+
+
+dev.off()
+
+```
+
+## Create granges lists for analyzing overlaps
+
+```{r}
+macs_h3k27me3_list  <- list(
+  "Biological" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
+  "No_Duplicates" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs3.nolambda_peaks`,
+  "All_Reads" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs3.nolambda_peaks`,
+  "ENCODE" = h3k27me3_encode_gr)
+
+seacr_stringent_h3k27me3_list <- list(
+  "Biological" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.seacr.control.peaks.stringent.bed`,
+  "No_Duplicates" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.seacr.control.peaks.stringent.bed`,
+  "All_Reads" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.seacr.control.peaks.stringent.bed`,
+  "ENCODE" = h3k27me3_encode_gr)
+
+seacr_relaxed_h3k27me3_list <- list(
+  "Biological" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.seacr.control.peaks.relaxed.bed`,
+  "No_Duplicates" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.seacr.control.peaks.relaxed.bed`,
+  "All_Reads" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.seacr.control.peaks.relaxed.bed`,
+  "ENCODE" = h3k27me3_encode_gr)
+
+macs_rad21_list <- list(
+  "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.macs3.nolambda_peaks`,
+  "No_Duplicates" = granges_list$RAD21$`NTC_RAD21-batch61_A-rmDup.macs3.nolambda_peaks`,
+  "All_Reads" = granges_list$RAD21$`NTC_RAD21-batch61_A-withDups.macs3.nolambda_peaks`)
+
+seacr_stringent_rad21_list <- list(
+  "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.seacr.control.peaks.stringent.bed`,
+  "No_Duplicates" = granges_list$RAD21$`NTC_RAD21-batch61_A-rmDup.seacr.control.peaks.stringent.bed`,
+  "All_Reads" = granges_list$RAD21$`NTC_RAD21-batch61_A-withDups.seacr.control.peaks.stringent.bed`)
+
+seacr_relaxed_rad21_list <- list(
+  "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.seacr.control.peaks.relaxed.bed`,
+  "No_Duplicates" = granges_list$RAD21$`NTC_RAD21-batch61_A-rmDup.seacr.control.peaks.relaxed.bed`,
+  "All_Reads" = granges_list$RAD21$`NTC_RAD21-batch61_A-withDups.seacr.control.peaks.relaxed.bed`)
+```
+
+
+
+```{r function for identifying peak overlaps}
+# Function to analyze all possible overlap scenarios between GRanges objects
+analyze_granges_overlaps <- function(granges_list) {
+  n_objects <- length(granges_list)
+  
+  # Get the names of your GRanges objects
+  object_names <- names(granges_list)
+  if (is.null(object_names)) {
+    object_names <- paste0("Object_", 1:n_objects)
+  }
+  
+  # Create results list to store all combinations
+  results_list <- list()
+  
+  # Generate all possible combinations and sort by size (largest first)
+  combinations <- list()
+  for (i in 1:(2^n_objects - 1)) {
+    binary <- intToBits(i)
+    included_indices <- which(binary == 01)
+    if (length(included_indices) > 0) {
+      combinations[[length(combinations) + 1]] <- included_indices
+    }
+  }
+  
+  # Sort combinations by size (largest first) to process higher-order overlaps first
+  combinations <- combinations[order(sapply(combinations, length), decreasing = TRUE)]
+  
+  # Track which peaks have been counted for each object
+  counted_peaks <- list()
+  for (i in 1:n_objects) {
+    counted_peaks[[i]] <- integer(0)
+  }
+  
+  # Process each combination
+  for (combo in combinations) {
+    included_names <- object_names[combo]
+    overlap_category <- paste(included_names, collapse = " + ")
+    
+    if (length(combo) == 1) {
+      # Single object - count remaining peaks (total minus already counted)
+      obj_idx <- combo[1]
+      total_peaks <- length(granges_list[[obj_idx]])
+      already_counted <- length(counted_peaks[[obj_idx]])
+      remaining_peaks <- total_peaks - already_counted
+      
+      if (remaining_peaks > 0) {
+        results_list[[length(results_list) + 1]] <- data.frame(
+          from = object_names[obj_idx],
+          to = overlap_category,
+          peak_count = remaining_peaks,
+          stringsAsFactors = FALSE
+        )
+      }
+    } else {
+      # Multiple objects - for each object in the combination
+      for (ref_idx in combo) {
+        ref_name <- object_names[ref_idx]
+        ref_peaks <- granges_list[[ref_idx]]
+        
+        # Count peaks from this reference object that overlap with ALL other objects in the combination
+        other_indices <- combo[combo != ref_idx]
+        
+        # Find peaks in reference object that overlap with each other object
+        overlapping_peaks <- 1:length(ref_peaks)
+        
+        for (other_idx in other_indices) {
+          overlaps <- findOverlaps(ref_peaks, granges_list[[other_idx]], maxgap = 5000, ignore.strand = TRUE)
+          overlapping_peaks <- intersect(overlapping_peaks, queryHits(overlaps))
+        }
+        
+        # Remove peaks that have already been counted in higher-order overlaps
+        new_overlapping_peaks <- setdiff(overlapping_peaks, counted_peaks[[ref_idx]])
+        
+        if (length(new_overlapping_peaks) > 0) {
+          results_list[[length(results_list) + 1]] <- data.frame(
+            from = ref_name,
+            to = overlap_category,
+            peak_count = length(new_overlapping_peaks),
+            stringsAsFactors = FALSE
+          )
+          
+          # Add these peaks to the counted list for this object
+          counted_peaks[[ref_idx]] <- c(counted_peaks[[ref_idx]], new_overlapping_peaks)
+        }
+      }
+    }
+  }
+  
+  # Combine all results
+  if (length(results_list) > 0) {
+    results <- do.call(rbind, results_list)
+    # Sort by from (ascending) and then by peak_count (descending)
+    results <- results[order(results$from, -results$peak_count), ]
+    
+    # Use dplyr to change "to" column to "unique" when from == to
+    results <- results %>%
+      mutate(to = ifelse(from == to, "unique", to))
+  } else {
+    results <- data.frame(from = character(0), to = character(0), peak_count = integer(0), stringsAsFactors = FALSE)
+  }
+  
+  return(results)
+}
+```
+
+
+
+```{r Run overlap analyses}
+# Run the analysis
+macs_h3k27me3_overlap_results <- analyze_granges_overlaps(macs_h3k27me3_list)
+seacr_stringent_h3k27me3_overlap_results <- analyze_granges_overlaps(seacr_stringent_h3k27me3_list)
+seacr_relaxed_h3k27me3_overlap_results <- analyze_granges_overlaps(seacr_relaxed_h3k27me3_list)
+
+macs_rad21_overlap_results <- analyze_granges_overlaps(macs_rad21_list)
+seacr_stringent_rad21_overlap_results <- analyze_granges_overlaps(seacr_stringent_rad21_list)
+seacr_relaxed_rad21_overlap_results <- analyze_granges_overlaps(seacr_relaxed_rad21_list)
+
+print(macs_h3k27me3_overlap_results)
+```
+
+## Create chord plots
+
+```{r Function for chord plots}
+# Function to create chord diagram
+create_chord_diagram <- function(data, source_colors, grid_colors, filename = "chord_diagram.pdf", title_text = "Chord Diagram", grid_thickness = 4, start_degree = 0) {
+  # Start PDF output
+  pdf(filename, width = 12, height = 12)
+  
+  # Clear any previous circos settings
+  circos.clear()
+  
+  # Set starting degree for rotation
+  circos.par(start.degree = start_degree)
+  
+  # Create sector order for left/right positioning
+  all_sectors <- unique(c(data$from, data$to))
+  source_datasets <- c("Biological", "No_Duplicates", "All_Reads", "ENCODE")
+  
+  # Try different ordering - maybe we need to reverse the order
+  source_sectors <- source_datasets[source_datasets %in% all_sectors]
+  overlap_sectors <- all_sectors[!all_sectors %in% source_datasets]
+  sector_order <- c(overlap_sectors, source_sectors)
+  
+  # Create chord diagram with custom grid thickness and sector order
+  chordDiagram(data, 
+               order = sector_order,
+               col = source_colors[data$from],
+               grid.col = grid_colors,
+               transparency = 0.2,
+               directional = 0,
+               #link.sort = TRUE,
+               #link.decreasing = TRUE,
+               annotationTrack = c("grid", "axis"),
+               preAllocateTracks = list(
+                 track.height = mm_h(grid_thickness),
+                 track.margin = c(mm_h(grid_thickness), 0)
+               ))
+  
+  # Add custom sector labels with scientific notation
+  circos.track(track.index = 2, panel.fun = function(x, y) {
+    sector.index = get.cell.meta.data("sector.index")
+    xlim = get.cell.meta.data("xlim")
+    ylim = get.cell.meta.data("ylim")
+    
+    # Get the total value for this sector
+    sector_total <- sum(data$peak_count[data$from == sector.index | data$to == sector.index])
+    
+    # Format in scientific notation
+    label_text <- formatC(sector_total, format = "e", digits = 1)
+    
+    # Add the label with larger font
+    circos.text(mean(xlim), mean(ylim), label_text, 
+                cex = 1.2, niceFacing = TRUE, col = "black")
+  }, bg.border = NA)
+  
+  # Add title
+  title(title_text, cex.main = 1.5)
+  
+  # Add legend for source datasets
+  legend("bottomleft", 
+         legend = names(source_colors),
+         col = source_colors,
+         pch = 15,
+         title = "Source Datasets",
+         bty = "n")
+  
+  # Add comprehensive legend for all sector categories
+  all_sector_categories <- unique(c(data$from, data$to))
+  
+  # Create legend items and colors for all sectors
+  legend_items <- c()
+  legend_colors <- c()
+  
+  # Add source datasets
+  for(dataset in names(source_colors)) {
+    if(dataset %in% all_sector_categories) {
+      legend_items <- c(legend_items, dataset)
+      legend_colors <- c(legend_colors, source_colors[dataset])
+    }
+  }
+  
+  # Add unique
+  if("unique" %in% all_sector_categories) {
+    legend_items <- c(legend_items, "unique")
+    legend_colors <- c(legend_colors, grid_colors["unique"])
+  }
+  
+  # Add 4-way overlap
+  four_way_name <- "Biological + No_Duplicates + All_Reads + ENCODE"
+  if(four_way_name %in% all_sector_categories) {
+    legend_items <- c(legend_items, "All 4 datasets")
+    legend_colors <- c(legend_colors, grid_colors[four_way_name])
+  }
+  
+  # Add other overlap categories
+  other_overlaps <- all_sector_categories[!all_sector_categories %in% c(names(source_colors), "unique", four_way_name)]
+  for(overlap in other_overlaps) {
+    legend_items <- c(legend_items, overlap)
+    legend_colors <- c(legend_colors, grid_colors[overlap])
+  }
+  
+  legend("bottomright", 
+         legend = legend_items,
+         col = legend_colors,
+         pch = 15,
+         title = "All Sector Categories",
+         bty = "n",
+         cex = 0.8)
+  
+  # Close PDF
+  dev.off()
+  cat("Chord diagram saved as:", filename, "\n")
+}
+
+```
+
+
+
+```{r Create chord plots for H3K27me3}
+source_colors <- c(
+  "Biological" = "#f68c1f", 
+  "No_Duplicates" = "#0b8140",
+  "All_Reads" = "#4e69b1", 
+  "ENCODE" = "black"
+)
+
+# Get all unique sectors and create comprehensive color scheme
+all_sectors <- unique(c(overlap_results$from, overlap_results$to))
+grid_colors <- rep("lightgray", length(all_sectors))
+names(grid_colors) <- all_sectors
+
+# Set colors for main source sectors
+grid_colors[names(source_colors)] <- source_colors
+
+# Set colors for overlap categories
+grid_colors["unique"] <- "grey"
+grid_colors["Biological + No_Duplicates + All_Reads + ENCODE"] <- "#987d53"
+grid_colors["Biological + No_Duplicates + All_Reads"] <- "#ed2024"
+
+# Set colors for other overlap categories
+overlap_sectors <- all_sectors[!all_sectors %in% c(names(source_colors), "unique", "Biological + No_Duplicates + All_Reads + ENCODE")]
+grid_colors[overlap_sectors] <- ifelse(seq_along(overlap_sectors) %% 2 == 1, "#ed2024", "#ed2024")
+
+# Create the chord diagram
+create_chord_diagram(macs_h3k27me3_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_macs_sc_h3k27me3_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+
+create_chord_diagram(seacr_stringent_h3k27me3_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_seacr-stringent_sc_h3k27me3_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+
+create_chord_diagram(seacr_relaxed_h3k27me3_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_seacr-relaxed_sc_h3k27me3_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+
+```
+
+
+
+```{r Create chord plots for RAD21}
+source_colors <- c(
+  "Biological" = "#f68c1f", 
+  "No_Duplicates" = "#0b8140",
+  "All_Reads" = "#4e69b1"
+)
+
+# Get all unique sectors and create comprehensive color scheme
+all_sectors <- unique(c(overlap_results$from, overlap_results$to))
+grid_colors <- rep("lightgray", length(all_sectors))
+names(grid_colors) <- all_sectors
+
+# Set colors for main source sectors
+grid_colors[names(source_colors)] <- source_colors
+
+# Set colors for overlap categories
+grid_colors["unique"] <- "grey"
+grid_colors["Biological + No_Duplicates + All_Reads"] <- "#987d53"
+grid_colors["Biological + No_Duplicates"] <- "#ed2024"
+
+# Set colors for other overlap categories
+overlap_sectors <- all_sectors[!all_sectors %in% c(names(source_colors), "unique", "Biological + No_Duplicates + All_Reads + ENCODE")]
+grid_colors[overlap_sectors] <- ifelse(seq_along(overlap_sectors) %% 2 == 1, "#ed2024", "#ed2024")
+
+# Create the chord diagram
+create_chord_diagram(macs_rad21_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_macs_sc_rad21_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+
+create_chord_diagram(seacr_stringent_rad21_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_seacr-stringent_sc_rad21_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+
+create_chord_diagram(seacr_relaxed_rad21_overlap_results, source_colors, grid_colors, 
+                     "figures/ChordPlot_seacr-relaxed_sc_rad21_genomic_overlap.pdf", 
+                     "Genomic Ranges Overlap Analysis\n(5kb tolerance)",
+                     grid_thickness = 45,
+                     start_degree = 0)
+```
+
+
+
+##Session Info
+```{r print session info}
+sessionInfo()
+```
