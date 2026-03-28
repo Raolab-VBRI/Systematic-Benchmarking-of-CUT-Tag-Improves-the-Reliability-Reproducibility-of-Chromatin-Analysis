@@ -19,12 +19,12 @@ library(circlize)
 
 ```{r Make Directories}
 igg_dir <- file.path("alignment", "bedgraph")
-macs_dir <- file.path("peakCalling", "MACS3")
+macs_dir <- file.path("peakCalling", "MACS2")
 cutoff_dir <- file.path(macs_dir, "cutoff_analysis")
 rmdup_cutoff_dir <- file.path(macs_dir, "cutoff_analysis_rmdup")
 seacrRelaxed_dir <- file.path("peakCalling", "SEACR")
 seacrStringent_dir <- file.path("peakCalling", "SEACR", "stringent")
-macs_dir <- file.path("peakCalling", "MACS3")
+macs_dir <- file.path("peakCalling", "MACS2")
 bam_dir <- file.path("alignment", "bam")
 consensus_dir <- file.path("peakCalling", "consensus")
 encode_H3K27me3_dir <- file.path("ref_genomes", "H3K27me3_ENCFF977FWM.bed")
@@ -125,15 +125,15 @@ for(target in targetList){
 ##Compare Peak Overlaps with Chip Peak Anno
 ```{r CTCF Peak Overlaps}
 macs_h3k27me3_sc_ol <- findOverlapsOfPeaks(
-  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
-  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs3.nolambda_peaks`,
-  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs3.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs2.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs2.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs2.nolambda_peaks`,
   h3k27me3_encode_gr,
   maxgap = 10000,
   connectedPeaks = "keepAll")
 
 macs_h3k27me3_sc_biological_ol <- findOverlapsOfPeaks(
-  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
+  granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs2.nolambda_peaks`,
   h3k27me3_encode_gr,
   maxgap = 5000,
   connectedPeaks = "keepAll")
@@ -220,9 +220,9 @@ dev.off()
 
 ```{r}
 macs_h3k27me3_list  <- list(
-  "Biological" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs3.nolambda_peaks`,
-  "No_Duplicates" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs3.nolambda_peaks`,
-  "All_Reads" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs3.nolambda_peaks`,
+  "Biological" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-biological.macs2.nolambda_peaks`,
+  "No_Duplicates" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-rmDup.macs2.nolambda_peaks`,
+  "All_Reads" = granges_list$H3K27me3$`okur_H3K27me3-batch37_R1-withDups.macs2.nolambda_peaks`,
   "ENCODE" = h3k27me3_encode_gr)
 
 seacr_stringent_h3k27me3_list <- list(
@@ -238,9 +238,9 @@ seacr_relaxed_h3k27me3_list <- list(
   "ENCODE" = h3k27me3_encode_gr)
 
 macs_rad21_list <- list(
-  "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.macs3.nolambda_peaks`,
-  "No_Duplicates" = granges_list$RAD21$`NTC_RAD21-batch61_A-rmDup.macs3.nolambda_peaks`,
-  "All_Reads" = granges_list$RAD21$`NTC_RAD21-batch61_A-withDups.macs3.nolambda_peaks`)
+  "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.macs2.nolambda_peaks`,
+  "No_Duplicates" = granges_list$RAD21$`NTC_RAD21-batch61_A-rmDup.macs2.nolambda_peaks`,
+  "All_Reads" = granges_list$RAD21$`NTC_RAD21-batch61_A-withDups.macs2.nolambda_peaks`)
 
 seacr_stringent_rad21_list <- list(
   "Biological" = granges_list$RAD21$`NTC_RAD21-batch61_A-biological.seacr.control.peaks.stringent.bed`,

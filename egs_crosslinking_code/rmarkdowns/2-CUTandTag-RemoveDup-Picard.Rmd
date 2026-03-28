@@ -117,8 +117,6 @@ echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
 projPath="/scratch/g/srrao/EGSx_CUTnTag"
 bamPath="${projPath}/alignment/bam"
 outPath="${bamPath}/picard_summary"
-spikePath="${bamPath}/spike_bam"
-hg38Path="${bamPath}/hg38_bam"
 
 mkdir -p ${outPath}
 
@@ -153,15 +151,11 @@ export -f process_bam
 export picardCMD
 export outPath
 
-# Process hg38 BAMs. Picard can use up to 6 threads.
-cd $hg38Path
+# Process BAMs. Picard can use up to 6 threads.
+cd $bamPath
 echo "Processing hg38 BAMs in ${hg38Path}"
 ls *.bowtie2.bam | parallel -j 4 process_bam {} $outPath
 
-# Process spike-in BAMs
-cd $spikePath
-echo "Processing spike-in BAMs in ${spikePath}"
-ls *.bowtie2.bam | parallel -j 4 process_bam {} $outPath
 
 echo "Job completed at $(date)"
 
@@ -172,10 +166,6 @@ echo "Job completed at $(date)"
 sbatch scripts/5-picard.sh
 ```
 
-
-```{cat Create script for S3 normalization of BAM files, engine.opts = list(file = 'scripts/6-s3Norm.sh')}
-
-```
 
 
 
@@ -292,21 +282,7 @@ ggsave(filename = "EGSx_CnT_DupRate.pdf",
 
 
 
-```{r Graph bulk alignment & duplication}
-dupFig2a <- bulk_alignDupSummary %>%
-  ggplot(aes(x = Genotype, y = SpikeIn_DuplicationRate.y)) +
-  geom_boxplot(outlier.shape = NA) +
-  geom_jitter(aes(color = Replicate), position = position_jitter(0.15)) +
-  ylab("Duplication Rate (%)") +
-  xlab("") +
-  theme_classic() +
-  theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9), plot.title = element_text(size = 18, hjust = 0.5, margin = margin(0,0,10,0))) +
-  guides(fill="none") +
-  ggtitle("EGSx CUT&Tag - Murine Duplication Rate") +
-  facet_wrap(~ Target)
 
-dupFig2a
-```
 
 ## Aligned Fragments
 

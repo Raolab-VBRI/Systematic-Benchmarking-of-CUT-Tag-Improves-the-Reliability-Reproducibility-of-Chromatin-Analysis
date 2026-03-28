@@ -956,7 +956,7 @@ ggsave(filename = "scCnT_Picard_Histogram_H3K27me3.pdf",
 ```
 
 
-## Graph duplicate infor
+## Graph duplicate info
 
 This is a good plot for demonstrating the difference in biological duplicates for H3K27me3 vs RAD21
 ```{r Graph bulk alignment & duplication}

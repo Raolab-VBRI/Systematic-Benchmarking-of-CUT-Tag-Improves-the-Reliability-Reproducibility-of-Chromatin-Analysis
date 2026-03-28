@@ -32,14 +32,11 @@ cd ref_genomes/
 #Downloading fasta files for index. I will use the primary assembly of GRCh38. (2/6/24)
 wget https://ftp.ensembl.org/pub/release-111/fasta/homo_sapiens/dna/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
 
-#Get mm39 from ensembl. We are not using a hard masked version.
-#wget https://ftp.ensembl.org/pub/release-112/fasta/mus_musculus/dna/Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
 ```
 
 Use the sum command to ensure the downloads were successful.
 Here is what we should get:
 22450 861294 Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz
-16996 787519 Mus_musculus.GRCm39.dna.primary_assembly.fa.gz
 ```{bash Checksums for FASTA references}
 cd ref_genomes/
 
@@ -55,19 +52,8 @@ gzip -d *.fa.gz
 ```
 
 
-```{bash Modify the chromosome names of Mm fasta files}
-cd ref_genomes/
-
-cat Mus_musculus.GRCm39.dna.primary_assembly.fa | sed 's/>/>mm_/g' > Mus_musculus.GRCm39.dna.primary_assembly_mod.fa
-```
 
 
-```{bash}
-cd ref_genomes/
-
-#combine the modified Mm fasta with CRCh38
-cat *{GRCm39.dna.primary_assembly_mod,GRCh38.dna.primary}*.fa > bowtie_hg38_mm39_custom/Homo_sapiens.GRCh38.dna.primary_Mus_musculus.GRCm39.dna.primary.fa
-```
 
 
 Now we can use bowtie2 to create indexes. Be sure to request sufficient RAM since building indexes is memory intenstive.
@@ -220,7 +206,7 @@ ref="${projPath}/ref_genomes/Homo_sapiens.GRCh38.dna/Homo_sapiens.GRCh38.dna"
 align_sample() {
   # Store sample ID from first argument
   local i=$1
-  # All replicates have murine spike in
+  # All replicates are human
   local O="hg38"
   
   # Pipeline: bowtie2 alignment -> sam to bam conversion
@@ -263,15 +249,6 @@ sbatch scripts/3-bowtie2_align.sh
 ```
 
 
-We need to extract the primary alignments for our spike-in genomes. To do this we will need a text file that lists all the mouse chromosome names.
-```{bash Get Spike-In Chromosome Names}
-cd ref_genomes/bowtie_hg38_mm39_custom/
-
-cat Homo_sapiens.GRCh38.dna.primary_Mus_musculus.GRCm39.dna.primary.fa | grep "mm_" | cut -d " " -f 1 | sed 's/>//' | tr '\n' ' ' >MmChrNames.txt
-
-cd ..
-cat Homo_sapiens.GRCh38.dna.primary_assembly.fa | grep ">" | cut -d " " -f 1 | sed 's/>//' | tr '\n' ' ' >Hg38ChrNames.txt
-```
 
 
 ## Perform QC for Sequencing and Alignment

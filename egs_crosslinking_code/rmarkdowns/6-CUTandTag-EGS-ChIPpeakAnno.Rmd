@@ -36,7 +36,7 @@ jobreport_dir <- file.path("job_reports")
 diffbind_dir <- file.path("diffbind", "diffbind_results")
 consensus_dir <- file.path("diffbind", "occupancy_results")
 annotation_dir <- file.path("peak_annotations")
-peak_dir <- file.path("peakCalling", "MACS3")
+peak_dir <- file.path("peakCalling", "MACS2")
 homer_dir <- file.path(annotation_dir, "homer_results")
 figure_dir <- file.path("figures")
 
@@ -83,7 +83,7 @@ for(cond in c("_0nMEGS", "_200nMEGS", "_01pF")){
   # Initialize list to store peaks for this condition
   condition_peaks <- list()
   
-  for(sample in list.files(path = peak_dir, pattern = paste0(cond, "-[A-Z]\\.macs3\\.nolambda_peaks\\.narrowPeak$"))){
+  for(sample in list.files(path = peak_dir, pattern = paste0(cond, "-[A-Z]\\.macs2\\.nolambda_peaks\\.narrowPeak$"))){
     
 
     print(paste("Processing peak file:", sample))
@@ -184,18 +184,18 @@ capture.output({
 
 Active enhancers with CTCF binding are an important subset identified by Ren et al Molecular Cell 2017
 ```{r read in conensus peaks}
-nox_consensus <- read_delim(file = file.path(consensus_dir, "0nMEGS_CTCF_consensus.macs3.bed"),
+nox_consensus <- read_delim(file = file.path(consensus_dir, "0nMEGS_CTCF_consensus.macs2.bed"),
                             delim = "\t",
                             col_names = c("Chr", "Start", "End", "peakID", "conc_NTC")) %>%
                               makeGRangesFromDataFrame(keep.extra.columns = TRUE)
 
-egs_consensus <- read_delim(file = file.path(consensus_dir, "200nMEGS_CTCF_consensus.macs3.bed"),
+egs_consensus <- read_delim(file = file.path(consensus_dir, "200nMEGS_CTCF_consensus.macs2.bed"),
                             delim = "\t",
                             col_names = c("Chr", "Start", "End", "peakID", "conc_NTC")) %>%
                               makeGRangesFromDataFrame(keep.extra.columns = TRUE)
 
 
-pf_consensus <- read_delim(file = file.path(consensus_dir, "01pF_CTCF_consensus.macs3.bed"),
+pf_consensus <- read_delim(file = file.path(consensus_dir, "01pF_CTCF_consensus.macs2.bed"),
                             delim = "\t",
                             col_names = c("Chr", "Start", "End", "peakID", "conc_NTC", "strand")) %>%
                               makeGRangesFromDataFrame(keep.extra.columns = TRUE)

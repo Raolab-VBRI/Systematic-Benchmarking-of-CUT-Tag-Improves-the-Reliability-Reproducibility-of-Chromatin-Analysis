@@ -32,7 +32,7 @@ bpparam()
 jobreport_dir <- file.path("job_reports")
 diffbind_dir <- file.path("diffbind")
 bam_dir <- file.path("alignment", "bam", "hg38_bam")
-macs_dir <- file.path("peakCalling", "MACS3")
+macs_dir <- file.path("peakCalling", "MACS2")
 figure_dir <- file.path("figures")
 occupancy_dir <- file.path(diffbind_dir, "occupancy_results")
 res_dir <- file.path(diffbind_dir, "diffbind_results")
@@ -47,11 +47,11 @@ if(!dir.exists(res_dir)){
 ```
 
 
-## Read in Peaksets from MACS3
+## Read in Peaksets from MACS2
 DiffBind needs a sampleSheet with some key information: 
 SampleID (must be unique for each sample), Condition, Replicate (should be a number), bamReads (file path), bamControl (file path), Peaks (file path), PeakCaller (string that indicates what peak caller was used))
 
-```{r Create a dataframe with MACS3 metadata}
+```{r Create a dataframe with MACS2 metadata}
 bulk_sampleList <- scan(file = "BulkSampleList.txt", what = "character")
 to_match <- c("IgG")
 igg_list <- grep(paste(to_match, collapse = "|"), bulk_sampleList)
@@ -67,7 +67,7 @@ for(target in histlist){
     for(hist in sampleList){
       histInfo = strsplit(hist, "_")[[1]]
       
-       macs_ext <- ".macs3.nolambda_peaks.narrowPeak"
+       macs_ext <- ".macs2.nolambda_peaks.narrowPeak"
        peak_type <- "narrow"
         
       rep <- as.factor(c("A", "B", "C", "D", "E", "F", "G", "H"))
@@ -118,7 +118,7 @@ ctcf_dba
 
 
 
-This first heatmap is based on the peak files from MACS3 which are used to create "occupancy scores." Essentially, peaks with more overlaps are considered to be more closely correlated.
+This first heatmap is based on the peak files from MACS2 which are used to create "occupancy scores." Essentially, peaks with more overlaps are considered to be more closely correlated.
 ```{r dba heatmap}
 dba.plotHeatmap(ctcf_dba)
 ```
@@ -174,7 +174,7 @@ get_consensus <- function(
       # Export consensus peaks as a bed file
       if (!is.null(consensus_list[[cond]])) {
         rtracklayer::export.bed(consensus_list[[cond]],
-                              con = file.path(out_dir, paste0(cond, "_", target, "_consensus.macs3.bed")))
+                              con = file.path(out_dir, paste0(cond, "_", target, "_consensus.macs2.bed")))
         
         # Report # of consensus peaks
         print(paste0("Number of consensus peaks for ", cond, " ", target, " is: ", length(consensus_list[[cond]])))

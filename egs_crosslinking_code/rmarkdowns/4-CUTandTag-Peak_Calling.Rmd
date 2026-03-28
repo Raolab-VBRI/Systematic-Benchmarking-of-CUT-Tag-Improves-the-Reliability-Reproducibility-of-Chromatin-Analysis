@@ -18,7 +18,7 @@ igg_dir <- file.path("alignment", "bedgraph")
 
 data_dir <- file.path("data")
 
-macs_dir <- file.path("peakCalling", "MACS3")
+macs_dir <- file.path("peakCalling", "MACS2")
 cutoff_dir <- file.path(macs_dir, "cutoff_analysis")
 
 bam_dir <- file.path("alignment", "bam")
@@ -36,14 +36,14 @@ library(ggpubr)
 
 
 
-## MACS3 Peak Calling 
+## MACS2 Peak Calling 
 ### Cut off analysis
-Determine cutoff empirically using MACS3 --cutoff-analysis
-```{cat MACS3 Cutoff Analysis, engine.opts = list(file = 'scripts/9-MACS3_cutoff.sh')}
+Determine cutoff empirically using MACS2 --cutoff-analysis
+```{cat MACS2 Cutoff Analysis, engine.opts = list(file = 'scripts/9-MACS2_cutoff.sh')}
 #!/bin/bash
 
 #SBATCH -p normal # partition name
-#SBATCH --job-name=MACS3_cutoff # Job name
+#SBATCH --job-name=MACS2_cutoff # Job name
 #SBATCH --ntasks=1 # number of tasks
 #SBATCH --time 0-03:00 # time limit (day-hour:min)
 #SBATCH --cpus-per-task=25 # number of threads
@@ -58,13 +58,13 @@ echo Job name: ${SLURM_JOB_NAME}, Job ID: ${SLURM_JOB_ID}
 echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
 
 # Load modules
-module load macs3/3.0.2
+module load macs2
 module load parallel
 
 # Set directory paths
 projPath="/scratch/g/srrao/josiah_ociaml3/EGSx_CUTnTag"
 bamPath="${projPath}/alignment/bam/hg38_bam"
-peakPath="${projPath}/peakCalling/MACS3/cutoff_analysis"
+peakPath="${projPath}/peakCalling/MACS2/cutoff_analysis"
 
 # Create output directory
 mkdir -p "${peakPath}"
@@ -90,14 +90,14 @@ process_sample() {
     echo "Calling $peak_type peaks for: $i (Genotype: $geno, Replicate: $repli)"
     echo "Using IgG control: ${geno}_IgG_${repli}"
     
-    # Run MACS3 peak calling
+    # Run MACS2 peak calling
     # Parameters:
     # -t is the target file (this is the only required parameter for MACS2)
     # -c is the control file. 
     # -g is the mappable genome size (hs = homo sapiens)
-    # -f is the file type (macs3 can also take paired end bed files as input.
+    # -f is the file type (macs2 can also take paired end bed files as input.
     # --keep-dup auto uses a binomial distribution to calculate the maximum allowed duplicate reads
-    macs3 callpeak \
+    macs2 callpeak \
       -t "$i".hg38.bowtie2.rmDup.bam \
       -c "${geno}_IgG_${repli}".hg38.bowtie2.rmDup.bam \
       -f BAMPE $peak_type \
@@ -107,8 +107,8 @@ process_sample() {
       -q 0.01 --nolambda \
       --scale-to large \
       --keep-dup all \
-      -n ${peakPath}/"$i".macs3.nolambda.q0.01 \
-      2>${peakPath}/"$i".macs3.summary.txt
+      -n ${peakPath}/"$i".macs2.nolambda.q0.01 \
+      2>${peakPath}/"$i".macs2.summary.txt
       
 }
 
@@ -122,12 +122,12 @@ cd $bamPath
 # Call peaks using parallel processing (using 5 jobs at once = 25 total cores with 5 cores each)
 ls *.hg38.bowtie2.rmDup.bam | cut -d . -f 1 | grep -v 'IgG' | parallel -j 5 process_sample {}
 
-echo "All MACS3 peak calling jobs completed at $(date)"
+echo "All MACS2 peak calling jobs completed at $(date)"
 
 ```
 
-```{bash Submit MACS3 DiffBind Script to SLURM, engine.opts='-l'}
-sbatch scripts/9-MACS3_cutoff.sh
+```{bash Submit MACS2 DiffBind Script to SLURM, engine.opts='-l'}
+sbatch scripts/9-MACS2_cutoff.sh
 ```
 
 
@@ -138,7 +138,7 @@ read_cutoff_analysis <- function(file_path) {
     # Read the file, skipping any header lines that start with '#'
     df <- read.table(file_path, header = TRUE)
     
-    samp <- gsub(".macs3.nolambda.q0.01_cutoff_analysis.txt", "", basename(file_path)) %>%
+    samp <- gsub(".macs2.nolambda.q0.01_cutoff_analysis.txt", "", basename(file_path)) %>%
               str_split_1(pattern = "_", string = .)
 
     # Add sample name
@@ -210,7 +210,7 @@ ctcf_elbow
 
 
 ```{r}
-ggsave(filename = "EGSx_CnT_MACS3_elbowPlot_All.pdf", 
+ggsave(filename = "EGSx_CnT_MACS2_elbowPlot_All.pdf", 
        plot = all_elbow,
        width = 7, height = 4,
        path = figure_dir)
@@ -219,12 +219,12 @@ ggsave(filename = "EGSx_CnT_MACS3_elbowPlot_All.pdf",
 
 
 ### Peak Calling
-Let's create a script for MACS3 peak calling.
-```{cat MACS3 peak calling, engine.opts = list(file = 'scripts/10-MACS3_callPeaks.sh')}
+Let's create a script for MACS2 peak calling.
+```{cat MACS2 peak calling, engine.opts = list(file = 'scripts/10-MACS2_callPeaks.sh')}
 #!/bin/bash
 
 #SBATCH -p normal # partition name
-#SBATCH --job-name=MACS3_peaks # Job name
+#SBATCH --job-name=MACS2_peaks # Job name
 #SBATCH --ntasks=1 # number of tasks
 #SBATCH --time 0-06:00 # time limit (day-hour:min)
 #SBATCH --cpus-per-task=25 # number of threads
@@ -240,10 +240,10 @@ echo I have ${SLURM_CPUS_ON_NODE} CPUs on compute node $(hostname -s)
 
 projPath="/scratch/g/srrao/josiah_ociaml3/EGSx_CUTnTag"
 bamPath="${projPath}/alignment/bam/hg38_bam"
-peakPath="${projPath}/peakCalling/MACS3"
+peakPath="${projPath}/peakCalling/MACS2"
 
-# Load macs3 
-module load macs3/3.0.2
+# Load macs2 
+module load macs2
 module load parallel
 
 # Create peak directory
@@ -277,14 +277,14 @@ process_sample() {
     echo "Calling $peak_type peaks for: $i (Genotype: $geno, Replicate: $repli)"
     echo "Using IgG control: ${geno}_IgG_${repli}"
     
-    # Run MACS3 peak calling
+    # Run MACS2 peak calling
     # Parameters:
     # -t is the target file (this is the only required parameter for MACS2)
     # -c is the control file. 
     # -g is the mappable genome size (hs = homo sapiens)
-    # -f is the file type (macs3 can also take paired end bed files as input.
+    # -f is the file type (macs2 can also take paired end bed files as input.
     # --keep-dup auto uses a binomial distribution to calculate the maximum allowed duplicate reads
-    macs3 callpeak \
+    macs2 callpeak \
       -t "$i".hg38.bowtie2.rmDup.bam \
       -c "${geno}_IgG_${repli}".hg38.bowtie2.rmDup.bam \
       -f BAMPE $peak_type \
@@ -294,8 +294,8 @@ process_sample() {
       --nolambda \
       --scale-to large \
       --keep-dup all \
-      -n ${peakPath}/"$i".macs3.nolambda \
-      2>${peakPath}/"$i".macs3.summary.txt
+      -n ${peakPath}/"$i".macs2.nolambda \
+      2>${peakPath}/"$i".macs2.summary.txt
       
 
 }
@@ -310,12 +310,12 @@ cd $bamPath
 # Call peaks using parallel processing (using 5 jobs at once = 25 total cores with 5 cores each)
 ls *.hg38.bowtie2.rmDup.bam | cut -d . -f 1 | grep -v 'IgG' | parallel -j 5 process_sample {}
 
-echo "All MACS3 peak calling jobs completed at $(date)"
+echo "All MACS2 peak calling jobs completed at $(date)"
 ```
 
 
-```{bash Submit MACS3 Script to SLURM, engine.opts='-l'}
-sbatch scripts/10-MACS3_callPeaks.sh
+```{bash Submit MACS2 Script to SLURM, engine.opts='-l'}
+sbatch scripts/10-MACS2_callPeaks.sh
 ```
 
 ## SEACR peak calling
@@ -368,7 +368,7 @@ GetPeakN <- function(
                                  PeakWidth = peakInfo$width)  %>% 
           rbind(peakWidth, .)
        
-      # Handle broad peak files from MACS3   
+      # Handle broad peak files from MACS2   
       }else if(file.size(broadPath) != 0 & file.exists(broadPath)){
           peakInfo = read.table(broadPath, header = FALSE, fill = TRUE)  %>% 
           mutate(width = abs(V3-V2))
@@ -413,12 +413,12 @@ bulk_alignDupSummary <- readRDS("alignSummary.rds")
 
 
 
-```{r Collect MACS3 Peak Info}
+```{r Collect MACS2 Peak Info}
 macs_peakNumData <- GetPeakN(samples = bulk_sampleList,
          sampleDelimiter = "_",
          peakPath = macs_dir,
-         peakExt = ".macs3.nolambda_peaks.narrowPeak",
-         peakName = "macs3Peaks")
+         peakExt = ".macs2.nolambda_peaks.narrowPeak",
+         peakName = "macs2Peaks")
 ```
 
 
@@ -434,9 +434,9 @@ peakinfo_means <- peakinfo %>%
   filter(!grepl("IgG", Target)) %>%
   group_by(crosslinking) %>%
   summarise(
-    mean_peaks = mean(macs3Peaks, na.rm = TRUE),
-    median_peaks = median(macs3Peaks, na.rm = TRUE),
-    sd_peaks = sd(macs3Peaks, na.rm = TRUE),
+    mean_peaks = mean(macs2Peaks, na.rm = TRUE),
+    median_peaks = median(macs2Peaks, na.rm = TRUE),
+    sd_peaks = sd(macs2Peaks, na.rm = TRUE),
     n_samples = n(),
     .groups = 'drop'
   )
@@ -462,8 +462,8 @@ for (pair in pairwise_comparisons) {
   group1 <- pair[1]
   group2 <- pair[2]
   
-  data1 <- peakinfo_clean$macs3Peaks[peakinfo_clean$crosslinking == group1]
-  data2 <- peakinfo_clean$macs3Peaks[peakinfo_clean$crosslinking == group2]
+  data1 <- peakinfo_clean$macs2Peaks[peakinfo_clean$crosslinking == group1]
+  data2 <- peakinfo_clean$macs2Peaks[peakinfo_clean$crosslinking == group2]
   
   # Remove NA values
   data1 <- data1[!is.na(data1)]
@@ -498,7 +498,7 @@ for (pair in pairwise_comparisons) {
 peakN_fig1a <- peakinfo %>%
   filter(!grepl("IgG", Target)) %>%
   filter(!grepl("-01", crosslinking)) %>%
-  ggplot(aes(x = crosslinking, y = macs3Peaks)) +
+  ggplot(aes(x = crosslinking, y = macs2Peaks)) +
   geom_boxplot(outlier.shape = NA) + 
   ylab("Number of Peaks") +
   ggtitle("MACS2 Peaks") +
@@ -518,7 +518,7 @@ peakN_fig1a <- peakinfo %>%
 
 peakN_fig1b <- peakinfo %>%
   filter(!grepl("IgG", Target)) %>%
-  ggplot(aes(x = crosslinking, y = macs3Peaks)) +
+  ggplot(aes(x = crosslinking, y = macs2Peaks)) +
   geom_boxplot(outlier.shape = NA) + 
   ylab("Number of Peaks") +
   ggtitle("MACS2 Peaks") +
@@ -555,7 +555,7 @@ ggsave(filename = "EGS_CnT_PeakNumbers.pdf",
 
 ### Peak Overlaps 
 
-```{r Determine MACS3 Peak Reproducibility}
+```{r Determine MACS2 Peak Reproducibility}
 # List of genotypes = genL
 genL <- str_split(bulk_sampleList, pattern = "_", simplify = TRUE)[,1] %>% unique
 
@@ -581,18 +581,18 @@ for (target in tarL) {
     # First pass: load all GRanges objects for this target and peak type
     for (geno in genL) {
       for (rep in repL) {
-        # Build file path for macs3 peaks
-        peak_path <- file.path(macs_dir, paste0(geno, "_", target, "_", rep, ".macs3.nolambda_peaks.", type, "Peak"))
+        # Build file path for macs2 peaks
+        peak_path <- file.path(macs_dir, paste0(geno, "_", target, "_", rep, ".macs2.nolambda_peaks.", type, "Peak"))
         
         # Ensure file path is valid
         if (file.exists(peak_path)) {
           # Print valid peak paths
           print(peak_path)
           
-          # Read macs3 peak file as a table
+          # Read macs2 peak file as a table
           peakInfo <- read.table(peak_path, header = FALSE, fill = TRUE)
           
-          # Build a granges object from the macs3 peak table
+          # Build a granges object from the macs2 peak table
           peakInfo.gr <- GRanges(peakInfo$V1,
                               IRanges(start = peakInfo$V2, end = peakInfo$V3), 
                               strand = "*")
@@ -673,7 +673,7 @@ peakOL_fig1 <- peakReprod %>%
   geom_boxplot(outlier.shape = NA) + 
   ylab("% of Peaks Reproduced") +
   xlab("") +
-  ggtitle("MACS3 Peak Overlaps") +
+  ggtitle("MACS2 Peak Overlaps") +
   geom_jitter(position = position_jitter(0.15), aes(color = Replicate2)) +
   theme_classic() +
   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9),
@@ -723,7 +723,7 @@ macs_fig3a <- macs_peakNumData[[2]] %>%
   theme_classic() +
   theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1, size = 9),
         plot.title = element_text(hjust = 0.5)) +
-  ggtitle("MACS3 Peak Widths") +
+  ggtitle("MACS2 Peak Widths") +
   coord_cartesian(ylim = c(10,20000)) +
   facet_wrap(~crosslink)
 
@@ -733,7 +733,7 @@ macs_fig3a
 
 ### Peak FRiPs
 
-```{r Determine MACS3 FRiP scores}
+```{r Determine MACS2 FRiP scores}
 igg_list <- grep("IgG", bulk_sampleList)
 peakType <- peakType <- c("narrow", "broad")
 
