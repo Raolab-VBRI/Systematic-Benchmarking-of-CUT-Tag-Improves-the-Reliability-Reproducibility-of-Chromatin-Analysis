@@ -11,6 +11,10 @@ knitr::opts_chunk$set(echo = TRUE)
 
 Begin by creating environmental variables and directories.
 ```{r Create Enviromental Variables}
+proj_name <- "EGSx_CUTnTag" #Enter a name for your project's directory
+
+scratch_dir <- file.path("scratch", "g", "srrao", proj_name) #This builds a path for my RCC scratch directory
+
 jobreport_dir <- file.path("job_reports")
 figure_dir <- file.path("figures")
 data_dir <- file.path("data")
